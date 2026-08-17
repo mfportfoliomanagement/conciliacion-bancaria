@@ -848,8 +848,8 @@ MAPEO_CONTADOR = {
 # (categoria, cuenta_sugerida, patrón, aplica)  aplica: 'debito' | 'credito' | 'ambos'
 REGLAS_CONCEPTO = [
     ('SUELDOS',              CUENTA_SUELDOS_DEFAULT,           r'HABERES|SUELDO',                                'debito'),
-    ('IMP. LEY 25413 CRED',  'Impuesto al Crédito Ley 25.413', r'(?:IMP\.?\s*CRE|SOBRE\s*CRED).*25\.?413|25\.?413.*CRE', 'ambos'),
-    ('IMP. LEY 25413 DEB',   'Impuesto al Débito Ley 25.413',  r'25\.?413',                                      'ambos'),
+    ('IMP. LEY 25413 CRED',  'Impuesto al Crédito Ley 25.413', r'(?:IMP\.?\s*CRE|SOBRE\s*CRED).*25\.?413|25\.?413.*CRE|IMPUESTO A LOS CREDITOS', 'ambos'),
+    ('IMP. LEY 25413 DEB',   'Impuesto al Débito Ley 25.413',  r'25\.?413|DEBITOS Y CREDITOS|IMPUESTO A LOS DEBITOS|TRANSFINAN|TRANSACCIONES FINAN', 'ambos'),
     ('PERCEPCION IVA',       'Percepción de IVA Sufrida',      r'PERCEP\w*\.?\s*IVA|PERC\.?\s*IVA',               'debito'),
     ('SIRCREB',              'Sircreb',                        r'SIRCREB',                                       'debito'),
     ('PERCEPCION IIBB',      'Percepción Ingresos Brutos Sufrida', r'ING\.?\s*BRUT|INGRESOS BRUTOS|IIBB|PERC\w*\.?\s*(?:ING|CABA)|CABA\s*ING', 'debito'),
@@ -859,10 +859,19 @@ REGLAS_CONCEPTO = [
     ('IVA',                  'IVA Crédito Fiscal',             r'\bIVA\b',                                       'debito'),
     ('INTERESES',            'Gastos bancarios',               r'INTERES',                                       'debito'),
     ('IMPUESTOS AFIP/VEP',   '',                               r'IMP\.?\s*AFIP|PAGOS?\s*AFIP|SERVICIOS IMP',     'debito'),
-    ('PROVEEDOR',            'Proveedores',                    r'PROVEEDOR|TRF\s*INMED|TRANSFER|TRANSF|PAGO',    'debito'),
+    ('PROVEEDOR',            'Proveedores',                    r'PROVEEDOR|TRF\s*INMED|TRANSFER|TRANSF',         'debito'),
     ('COBRANZA',             None,                             r'.',                                             'credito'),
 ]
 _REGLAS = [(cat, cta, re.compile(pat, re.IGNORECASE), ap) for cat, cta, pat, ap in REGLAS_CONCEPTO]
+
+import unicodedata as _ud
+def _sin_acentos(s: str) -> str:
+    return ''.join(c for c in _ud.normalize('NFD', str(s)) if _ud.category(c) != 'Mn')
+
+def _txt_regla(m) -> str:
+    """Texto del movimiento normalizado para las reglas: sin acentos ni puntos, MAYÚSCULAS.
+       Así 'I.V.A.' -> 'IVA' y 'Débitos y Créditos' -> 'DEBITOS Y CREDITOS'."""
+    return _sin_acentos(f"{m.concepto} {m.nombre} {m.referencia}").upper().replace('.', '')
 
 def _texto_mov(m: Movimiento) -> str:
     # En Galicia el nombre/detalle (p.ej. 'HABERES') va en 'nombre'; se incluye.
@@ -915,7 +924,7 @@ def clasificar(res: Resultado, cuenta_sueldos: str = CUENTA_SUELDOS_DEFAULT, map
                     m.categoria = 'MAPEO'; m.cuenta_sugerida = tabla[k]
                     break
             if m.categoria: continue
-        txt = _texto_mov(m); es_deb = m.debito > 0; es_cred = m.credito > 0
+        txt = _txt_regla(m); es_deb = m.debito > 0; es_cred = m.credito > 0
         for cat, cta, rx, ap in _REGLAS:
             if ap == 'debito' and not es_deb: continue
             if ap == 'credito' and not es_cred: continue
