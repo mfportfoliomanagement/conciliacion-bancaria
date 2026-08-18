@@ -91,6 +91,11 @@ def fecha_dmy2(txt: str):
     m = re.match(r'(\d{2})/(\d{2})/(\d{2})$', txt)
     return datetime.date(2000+int(m[3]), int(m[2]), int(m[1])) if m else None
 
+def fecha_dmy4(txt: str):
+    """dd/mm/yyyy -> date (año completo; lo usa el extracto Office Banking de Galicia)."""
+    m = re.match(r'(\d{2})/(\d{2})/(\d{4})$', txt)
+    return datetime.date(int(m[3]), int(m[2]), int(m[1])) if m else None
+
 _MESES = {'ENE':1,'FEB':2,'MAR':3,'ABR':4,'MAY':5,'JUN':6,
           'JUL':7,'AGO':8,'SEP':9,'OCT':10,'NOV':11,'DIC':12}
 def fecha_dMMMy(txt: str):
@@ -403,6 +408,84 @@ def leer_galicia(pdf) -> Resultado:
     return Resultado('Banco Galicia', titular, cuit_tit, cuenta, periodo, saldo_ini, saldo_fin, out)
 
 # ---------------------------------------------------------------------------
+# GALICIA "OFFICE BANKING" (export "Movimientos de CC") — FORMATO DISTINTO al
+# "Resumen de Cuenta Corriente" clásico. Diferencias que obligan a un lector propio:
+#   * Columnas en orden Fecha | Descripción | DÉBITOS | CRÉDITOS | Saldos
+#     (débito ANTES que crédito; en el clásico es al revés).
+#   * Fecha con AÑO COMPLETO (dd/mm/aaaa), no dd/mm/aa.
+#   * Importe con SIGNO: "+ $ ..." = crédito ; "- $ ..." = débito. El saldo va sin signo.
+#   * NO hay fila "Total" final. El saldo aparece en CADA fila -> el control de saldo
+#     fila por fila es la garantía de integridad.
+#   * No trae nombre del titular ni su CUIT en la cabecera (quedan vacíos).
+# Posiciones reales medidas sobre el PDF (borde derecho x1 de cada número):
+#   débito  ~329 | crédito ~428 | saldo ~534 . Se clasifica por el SIGNO (robusto),
+#   con respaldo por posición si faltara el signo.
+# ---------------------------------------------------------------------------
+def leer_galicia_ob(pdf) -> Resultado:
+    from collections import defaultdict
+    HDR = {'Fecha', 'Descripción', 'Débitos', 'Créditos', 'Saldos'}
+    DATE4 = re.compile(r'^\d{2}/\d{2}/\d{4}$')
+
+    # Cabecera de la cuenta (solo en página 1)
+    t0 = pdf.pages[0].extract_text() or ''
+    mcta = re.search(r'Movimientos de CC.*?\$?\s*([\d\-]+\s+[\d\-]+)', t0)
+    cuenta = mcta.group(1).strip() if mcta else ''
+
+    movs = []; cur = None
+    for page in pdf.pages:
+        lineas = defaultdict(list)
+        for w in page.extract_words():
+            lineas[round(w['top'])].append(w)
+        for top in sorted(lineas):
+            ws = sorted(lineas[top], key=lambda w: w['x0'])
+            textos = [w['text'] for w in ws]
+            # Saltar encabezado de columnas y el pie de página que se repiten
+            if HDR & set(textos):
+                continue
+            if any('descarga' in t.lower() or 'Banking' in t for t in textos):
+                continue
+            first = ws[0]
+            if DATE4.match(first['text']) and first['x0'] < 90:
+                # Nueva fila de movimiento
+                if cur: movs.append(cur)
+                desc = ' '.join(w['text'] for w in ws
+                                if 100 <= w['x0'] < 300 and not RE_NUM.match(w['text'])
+                                and w['text'] not in ('+', '-', '$')).rstrip(' -+').strip()
+                signo = next((w['text'] for w in ws if w['text'] in ('+', '-')), '')
+                nums = [(num_ar(w['text']), w['x1']) for w in ws if RE_NUM.match(w['text'])]
+                der = [n for n in nums if n[1] > 460]          # saldo = número más a la derecha
+                saldo = der[-1][0] if der else None
+                otros = [n for n in nums if n[1] <= 460]
+                imp = otros[0][0] if otros else 0.0
+                deb = cre = 0.0
+                if signo == '+':   cre = abs(imp)
+                elif signo == '-': deb = abs(imp)
+                else:                                           # respaldo por posición
+                    if otros and otros[0][1] < 360: deb = abs(imp)
+                    else:                           cre = abs(imp)
+                cur = dict(fecha=first['text'], desc=desc, deb=deb, cre=cre, saldo=saldo, det=[])
+            else:
+                # Línea de detalle (nombre, CUIT, CBU, VARIOS, etc.) del movimiento en curso
+                if cur is None: continue
+                det = [w['text'] for w in ws if 100 <= w['x0'] < 300]
+                if det: cur['det'].append(' '.join(det))
+    if cur: movs.append(cur)
+
+    out = []
+    for m in movs:
+        det = m['det']; nombre = det[0] if det else ''
+        cu = next((d.strip() for d in det if _CUIT11.match(d.strip())), '')
+        out.append(Movimiento(fecha_dmy4(m['fecha']), m['desc'], '', cu, nombre,
+                              m['deb'], m['cre'], m['saldo']))
+    periodo = ''
+    if out:
+        fs = [m.fecha for m in out if m.fecha]
+        if fs: periodo = f"{min(fs).strftime('%d/%m/%Y')} a {max(fs).strftime('%d/%m/%Y')}"
+    saldo_fin = out[-1].saldo if out and out[-1].saldo is not None else 0.0
+    saldo_ini = round(out[0].saldo - (out[0].credito - out[0].debito), 2) if out and out[0].saldo is not None else 0.0
+    return Resultado('Banco Galicia', '', '', cuenta, periodo, saldo_ini, saldo_fin, out)
+
+# ---------------------------------------------------------------------------
 # BBVA — 1 línea por movimiento, VARIAS CUENTAS por PDF. Débitos con signo.
 # Columnas por borde derecho: débito x1<460 | crédito x1<540 | saldo resto.
 # Cada cuenta: SALDO ANTERIOR ... movimientos ... SALDO AL / TOTAL MOVIMIENTOS.
@@ -671,6 +754,7 @@ _FIRMAS = [
     ('Banco Macro',  leer_macro,      lambda t: 'MACRO' in t or '30-50001008-4' in t),
     ('Banco BBVA',   leer_bbva,       lambda t: 'CTA.CTE.BANCARIA' in t or 'CUENTA PYME' in t or 'SALDO ANTERIOR' in t),
     ('Banco Galicia',leer_galicia,    lambda t: 'RESUMEN DE CUENTA CORRIENTE' in t),
+    ('Banco Galicia',leer_galicia_ob, lambda t: 'MOVIMIENTOS DE CC' in t and 'OFFICE BANKING' in t),
 ]
 
 def detectar_banco(pdf):
