@@ -931,6 +931,16 @@ MAPEO_CONTADOR = {
 # proveedor por CUIT->importe->nombre) -> queda marcado "a imputar".
 # (categoria, cuenta_sugerida, patrón, aplica)  aplica: 'debito' | 'credito' | 'ambos'
 REGLAS_CONCEPTO = [
+    # --- Servicios/proveedores identificados por NOMBRE (confirmados contra asientos del contador) ---
+    # Vienen con concepto genérico "PAGO DE SERVICIOS" o "DEB. AUTOM. DE SERV.", así que se
+    # reconocen por el nombre del prestador. Van arriba para ganar antes que reglas genéricas.
+    ('SERVICIO EDESUR',      'Energía Eléctrica',              r'EDESUR',                                        'debito'),
+    ('SERVICIO AYSA',        'Agua',                           r'\bAYSA\b',                                      'debito'),
+    ('SERVICIO VERISURE',    'Proveedores',                    r'VERISURE',                                      'debito'),
+    # --- Servicios identificados por NOMBRE (cuenta indicada por Martín / estudio 20/8/2026) ---
+    ('SERVICIO AGIP/ABL',    'Impuestos y Tasas',              r'AGIP',                                          'debito'),
+    ('SERVICIO EXPENSAS',    'Expensas',                       r'INTERFAST',                                     'debito'),
+    ('SERVICIO SEGUROS',     'Seguros',                        r'FED\.?\s*PATRONAL|FEDERACION PATRONAL',         'debito'),
     ('SUELDOS',              CUENTA_SUELDOS_DEFAULT,           r'HABERES|SUELDO',                                'debito'),
     ('IMP. LEY 25413 CRED',  'Impuesto al Crédito Ley 25.413', r'(?:IMP\.?\s*CRE|SOBRE\s*CRED).*25\.?413|25\.?413.*CRE|IMPUESTO A LOS CREDITOS', 'ambos'),
     ('IMP. LEY 25413 DEB',   'Impuesto al Débito Ley 25.413',  r'25\.?413|DEBITOS Y CREDITOS|IMPUESTO A LOS DEBITOS|TRANSFINAN|TRANSACCIONES FINAN', 'ambos'),
