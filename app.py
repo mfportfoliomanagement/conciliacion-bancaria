@@ -11,6 +11,7 @@ Correr local:  streamlit run app.py     Requisitos: pip install -r requirements.
 import os, tempfile
 import streamlit as st
 import conversor_extractos as C
+import importador_xubio as IX
 
 st.set_page_config(page_title="Conciliación Bancaria", page_icon="🏦", layout="centered")
 
@@ -36,7 +37,8 @@ if not acceso_ok():
     st.stop()
 
 st.title("🏦 Conciliación Bancaria")
-st.caption("Subí el extracto del banco en **PDF** y descargá el Excel conciliado. "
+st.caption("Subí el extracto del banco en **PDF** y descargá el Excel conciliado "
+           "y el importador de asientos para Xubio. "
            "Bancos: Galicia, BBVA, Macro, Ciudad, Comafi, Supervielle.")
 
 archivos = st.file_uploader("Extracto(s) en PDF", type=["pdf"], accept_multiple_files=True)
@@ -77,5 +79,27 @@ for arch in archivos or []:
                        file_name=arch.name.rsplit('.', 1)[0] + " - conciliado.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     if todo_ok:
-        st.success("Todas las cuentas cerraron el control en cero ✓")
-    os.unlink(ruta_pdf); os.unlink(ruta_xlsx)
+        st.success("Todas las cuentas cerraron el control de saldo en cero ✓")
+
+    # ---- CAPA 3: importador de asientos para Xubio ----
+    st.markdown("**📘 Asientos para Xubio**")
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmpimp:
+        ruta_imp = tmpimp.name
+    IX.generar_excel(resultados, ruta_imp)
+    cobertura = IX.control_cobertura(resultados)
+    for r in cobertura:
+        if r["completo"]:
+            st.caption(f"Cta {r['cuenta']}: importador COMPLETO ✓ — refleja todo el extracto.")
+        else:
+            st.warning(f"⚠️ Cta {r['cuenta']}: importador INCOMPLETO — faltan imputar "
+                       f"${r['faltan_monto']:,.2f} en {r['faltan_movimientos']} movimiento(s). "
+                       "Resolvé la hoja **A REVISAR** antes de subirlo a Xubio.")
+    with open(ruta_imp, "rb") as fh:
+        data_imp = fh.read()
+    st.download_button("⬇️ Descargar importador de asientos (Xubio)", data=data_imp,
+                       file_name=arch.name.rsplit('.', 1)[0] + " - importador asientos.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.caption("El importador es un borrador de arranque: mientras el control diga INCOMPLETO, "
+               "primero resolvé lo que quede en la hoja A REVISAR antes de importarlo a Xubio.")
+
+    os.unlink(ruta_pdf); os.unlink(ruta_xlsx); os.unlink(ruta_imp)
