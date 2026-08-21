@@ -33,6 +33,7 @@ INV = 'INVERSIONES EN BANCO'
 OTR = 'OTROS MOVIMIENTOS'
 TRP = 'TRANSFERENCIA ENTRE CUENTAS PROPIAS'
 REVISAR = '__REVISAR__'   # sin circuito definido: queda para imputación humana
+INTERNO = '__INTERNO__'   # transferencia entre cuentas propias: NO va al importador (se excluye a propósito)
 
 MAPA_CUENTA = {
     # cuenta interna (Capa 2)                 : (nombre exacto Xubio,            circuito)
@@ -72,6 +73,13 @@ MAPA_CUENTA = {
     'SEGURIDAD':                                ('SEGURIDAD',                       OTR),
 
     'Transferencias entre cuentas':             ('Transferencias entre cuentas',    TRP),
+
+    # --- Transferencias entre cuentas propias de la empresa: NO van al importador ---
+    # (el contador las registra una sola vez / aparte, para no duplicar plata interna).
+    # Cuando el clasificador manda un movimiento a otra cuenta-banco propia, cae acá.
+    'Banco Galicia en $':                       ('Banco Galicia en $',              INTERNO),
+    'Banco':                                    ('Banco',                           INTERNO),
+    'Banco HSBC':                               ('Banco HSBC',                      INTERNO),
 
     # --- Sin circuito definido: NO se imputan solas, van a revisión humana ---
     'AFIP-RENTAS':                              ('AFIP-RENTAS',                     REVISAR),  # se desglosa con el VEP
@@ -113,6 +121,7 @@ def construir_asientos(resultados):
     """
     asientos = []
     revisar_global = []  # movimientos sin cuenta o con circuito REVISAR
+    internas_global = []  # transferencias entre cuentas propias (excluidas del importador)
 
     for res in resultados:
         banco = _nombre_banco(res)
@@ -137,6 +146,9 @@ def construir_asientos(resultados):
                 revisar_global.append((res, m, f'cuenta no mapeada: {cuenta_int}'))
                 continue
             nombre_xubio, circuito = mapeo
+            if circuito == INTERNO:
+                internas_global.append((res, m))   # transferencia entre cuentas propias: se excluye
+                continue
             if circuito == REVISAR:
                 revisar_global.append((res, m, f'circuito a revisar: {cuenta_int}'))
                 continue
@@ -174,7 +186,7 @@ def construir_asientos(resultados):
             if lineas:
                 asientos.append(dict(fecha=fecha, concepto=concepto, banco=banco,
                                      circuito=circuito, lineas=lineas))
-    return asientos, revisar_global
+    return asientos, revisar_global, internas_global
 
 
 def _control_asiento(asiento):
@@ -194,16 +206,26 @@ def control_cobertura(resultados):
     """
     reporte = []
     for res in resultados:
-        total_extracto = 0.0      # todo lo que movió el banco
+        total_extracto = 0.0      # movimiento del banco EXCLUYENDO transferencias internas
         total_importado = 0.0     # lo que entró al importador (clasificado y con circuito)
         falta_monto = 0.0
         falta_cant = 0
+        internas_cant = 0
+        internas_monto = 0.0
         for m in res.movimientos:
             neto = _r2(_r2(m.credito) - _r2(m.debito))
-            total_extracto = _r2(total_extracto + neto)
             cuenta_int = getattr(m, 'cuenta_sugerida', '') or ''
             mapeo = MAPA_CUENTA.get(cuenta_int)
-            clasificado_ok = bool(cuenta_int) and mapeo is not None and mapeo[1] != REVISAR and m.fecha is not None
+            circuito = mapeo[1] if mapeo else None
+
+            if circuito == INTERNO:
+                # transferencia entre cuentas propias: se excluye a propósito (no es faltante)
+                internas_cant += 1
+                internas_monto = _r2(internas_monto + abs(neto))
+                continue
+
+            total_extracto = _r2(total_extracto + neto)
+            clasificado_ok = bool(cuenta_int) and mapeo is not None and circuito != REVISAR and m.fecha is not None
             if clasificado_ok:
                 total_importado = _r2(total_importado + neto)
             else:
@@ -216,6 +238,8 @@ def control_cobertura(resultados):
             diferencia=_r2(total_extracto - total_importado),
             faltan_movimientos=falta_cant,
             faltan_monto=falta_monto,
+            internas_movimientos=internas_cant,
+            internas_monto=internas_monto,
             completo=(falta_cant == 0),
         ))
     return reporte
@@ -226,7 +250,7 @@ def generar_excel(resultados, path):
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment
 
-    asientos, revisar = construir_asientos(resultados)
+    asientos, revisar, internas = construir_asientos(resultados)
     wb = openpyxl.Workbook()
 
     # ---------- Hoja IMPORTADOR ASIENTOS ----------
@@ -279,24 +303,42 @@ def generar_excel(resultados, path):
         for col, w in zip('ABCDEFG', [18, 12, 40, 28, 14, 14, 30]):
             wv.column_dimensions[col].width = w
 
+    # ---------- Hoja TRANSFERENCIAS INTERNAS (excluidas a propósito) ----------
+    if internas:
+        wt = wb.create_sheet('TRANSF. INTERNAS')
+        wt.append(['CUENTA (extracto)', 'FECHA', 'CONCEPTO', 'NOMBRE', 'DÉBITO', 'CRÉDITO'])
+        for c in range(1, 7):
+            wt.cell(1, c).font = Font(bold=True)
+        for (res, m) in internas:
+            wt.append([str(getattr(res, 'cuenta', '')),
+                       m.fecha.strftime('%d/%m/%Y') if m.fecha else '',
+                       m.concepto, getattr(m, 'nombre', ''),
+                       _r2(m.debito) or '', _r2(m.credito) or ''])
+        wt.append([])
+        wt.append(['', '', 'Estas transferencias entre cuentas propias NO van al importador '
+                   '(se registran una sola vez / aparte, para no duplicar plata interna).'])
+        for col, w in zip('ABCDEF', [18, 12, 40, 28, 14, 14]):
+            wt.column_dimensions[col].width = w
+
     # ---------- Hoja CONTROL (cobertura global) ----------
     cob = control_cobertura(resultados)
     wc = wb.create_sheet('CONTROL')
-    wc.append(['CUENTA', 'MOVIÓ EL BANCO (extracto)', 'REFLEJADO EN IMPORTADOR',
-               'DIFERENCIA (falta imputar)', 'MOV. SIN CLASIFICAR', 'ESTADO'])
-    for c in range(1, 7):
+    wc.append(['CUENTA', 'MOVIÓ EL BANCO (sin internas)', 'REFLEJADO EN IMPORTADOR',
+               'DIFERENCIA (falta imputar)', 'MOV. SIN CLASIFICAR', 'TRANSF. INTERNAS', 'ESTADO'])
+    for c in range(1, 8):
         wc.cell(1, c).font = Font(bold=True)
     verde = PatternFill('solid', fgColor='C6EFCE')
     rojo = PatternFill('solid', fgColor='FFC7CE')
     for r in cob:
         estado = 'COMPLETO ✓' if r['completo'] else 'INCOMPLETO — faltan cuentas'
+        internas_txt = f"{r.get('internas_movimientos', 0)} (${r.get('internas_monto', 0):,.2f})"
         wc.append([r['cuenta'], r['total_extracto'], r['total_importado'],
-                   r['diferencia'], r['faltan_movimientos'], estado])
+                   r['diferencia'], r['faltan_movimientos'], internas_txt, estado])
         fila = wc.max_row
-        wc.cell(fila, 6).fill = verde if r['completo'] else rojo
-        wc.cell(fila, 6).font = Font(bold=True)
-    for col, w in zip('ABCDEF', [22, 26, 26, 26, 20, 30]):
+        wc.cell(fila, 7).fill = verde if r['completo'] else rojo
+        wc.cell(fila, 7).font = Font(bold=True)
+    for col, w in zip('ABCDEFG', [22, 26, 26, 26, 20, 22, 30]):
         wc.column_dimensions[col].width = w
 
     wb.save(path)
-    return asientos, revisar
+    return asientos, revisar, internas
