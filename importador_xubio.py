@@ -98,6 +98,13 @@ BANCO_POR_CUENTA = {
 }
 BANCO_DEFAULT = 'Banco'
 
+# Nombre de la cuenta contable de la OTRA cuenta propia (contrapartida de una transferencia
+# interna recibida). Parametrizable por cliente, igual que BANCO_POR_CUENTA.
+CONTRA_INTERNA = {
+    'Banco Galicia en $': 'Banco',
+    'Banco': 'Banco Galicia en $',
+}
+
 
 def _nombre_banco(res) -> str:
     cta = str(getattr(res, 'cuenta', '') or '')
@@ -147,7 +154,16 @@ def construir_asientos(resultados):
                 continue
             nombre_xubio, circuito = mapeo
             if circuito == INTERNO:
-                internas_global.append((res, m))   # transferencia entre cuentas propias: se excluye
+                # Transferencia entre cuentas propias:
+                #  - RECIBIDA (crédito): se registra en ESTA cuenta como circuito TRANSFERENCIA
+                #    ENTRE CUENTAS PROPIAS (banco de esta cuenta DEBE, la otra cuenta HABER).
+                #  - ENVIADA (débito): se excluye (la registra la cuenta que recibe).
+                if _r2(m.credito) > 0:
+                    contra = CONTRA_INTERNA.get(banco, 'Transferencias entre cuentas propias')
+                    slot = agrupador[(clave_mes[0], clave_mes[1], TRP)][contra]
+                    slot[1] = _r2(slot[1] + _r2(m.credito))   # HABER de la otra cuenta
+                else:
+                    internas_global.append((res, m))          # enviada: se excluye
                 continue
             if circuito == REVISAR:
                 revisar_global.append((res, m, f'circuito a revisar: {cuenta_int}'))

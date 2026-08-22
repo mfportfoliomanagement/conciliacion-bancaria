@@ -451,18 +451,20 @@ def leer_galicia_ob(pdf) -> Resultado:
                 desc = ' '.join(w['text'] for w in ws
                                 if 100 <= w['x0'] < 300 and not RE_NUM.match(w['text'])
                                 and w['text'] not in ('+', '-', '$')).rstrip(' -+').strip()
-                signo = next((w['text'] for w in ws if w['text'] in ('+', '-')), '')
+                # Débito/crédito/saldo se determinan por la POSICIÓN de la columna (borde
+                # derecho x1), NO por el signo "+/-". Esto es robusto ante conceptos que
+                # tienen un guion en el nombre (ej. "NAVE - VENTA CON TARJETA"), que antes
+                # hacían leer un crédito como débito.
+                #   débito  x1~329 | crédito x1~428 | saldo x1~534
                 nums = [(num_ar(w['text']), w['x1']) for w in ws if RE_NUM.match(w['text'])]
-                der = [n for n in nums if n[1] > 460]          # saldo = número más a la derecha
-                saldo = der[-1][0] if der else None
-                otros = [n for n in nums if n[1] <= 460]
-                imp = otros[0][0] if otros else 0.0
-                deb = cre = 0.0
-                if signo == '+':   cre = abs(imp)
-                elif signo == '-': deb = abs(imp)
-                else:                                           # respaldo por posición
-                    if otros and otros[0][1] < 360: deb = abs(imp)
-                    else:                           cre = abs(imp)
+                saldo = None; deb = cre = 0.0
+                for val, x1 in nums:
+                    if x1 >= 481:        # columna Saldos (la más a la derecha)
+                        saldo = abs(val)
+                    elif x1 >= 378:      # columna Créditos
+                        cre = abs(val)
+                    else:                # columna Débitos
+                        deb = abs(val)
                 cur = dict(fecha=first['text'], desc=desc, deb=deb, cre=cre, saldo=saldo, det=[])
             else:
                 # Línea de detalle (nombre, CUIT, CBU, VARIOS, etc.) del movimiento en curso
@@ -475,7 +477,10 @@ def leer_galicia_ob(pdf) -> Resultado:
     for m in movs:
         det = m['det']; nombre = det[0] if det else ''
         cu = next((d.strip() for d in det if _CUIT11.match(d.strip())), '')
-        out.append(Movimiento(fecha_dmy4(m['fecha']), m['desc'], '', cu, nombre,
+        # El detalle (líneas debajo del movimiento: nombre, CUIT, "HONORARIOS", "ALQUILERES",
+        # CBU, etc.) se guarda en 'referencia' para que las reglas de clasificación puedan verlo.
+        referencia = ' '.join(det[1:]) if len(det) > 1 else ''
+        out.append(Movimiento(fecha_dmy4(m['fecha']), m['desc'], referencia, cu, nombre,
                               m['deb'], m['cre'], m['saldo']))
     periodo = ''
     if out:
@@ -939,8 +944,11 @@ REGLAS_CONCEPTO = [
     ('SERVICIO VERISURE',    'Proveedores',                    r'VERISURE',                                      'debito'),
     # --- Servicios identificados por NOMBRE (cuenta indicada por Martín / estudio 20/8/2026) ---
     ('SERVICIO AGIP/ABL',    'Impuestos y Tasas',              r'AGIP',                                          'debito'),
-    ('SERVICIO EXPENSAS',    'Expensas',                       r'INTERFAST',                                     'debito'),
-    ('SERVICIO SEGUROS',     'Seguros',                        r'FED\.?\s*PATRONAL|FEDERACION PATRONAL',         'debito'),
+    ('SERVICIO INTERFAST',   'Proveedores',                    r'INTERFAST',                                     'debito'),
+    ('SERVICIO SEGUROS',     'Impuestos y Tasas',              r'FED\.?\s*PATRONAL|FEDERACION PATRONAL',         'debito'),
+    # RESCATE/SUSCRIPCIÓN de FCI -> Inversiones (cuenta FCI). El desglose FCI vs
+    # "Resultado por Inversión" lo hace el contador aparte; el sistema pone el total en FCI.
+    ('INVERSIONES FCI',      'FCI',                            r'RESCATE|\bFIMA\b|SUSCRIPCION\s+FCI',            'ambos'),
     ('SUELDOS',              CUENTA_SUELDOS_DEFAULT,           r'HABERES|SUELDO',                                'debito'),
     ('IMP. LEY 25413 CRED',  'Impuesto al Crédito Ley 25.413', r'(?:IMP\.?\s*CRE|SOBRE\s*CRED).*25\.?413|25\.?413.*CRE|IMPUESTO A LOS CREDITOS', 'ambos'),
     ('IMP. LEY 25413 DEB',   'Impuesto al Débito Ley 25.413',  r'25\.?413|DEBITOS Y CREDITOS|IMPUESTO A LOS DEBITOS|TRANSFINAN|TRANSACCIONES FINAN', 'ambos'),
@@ -1002,6 +1010,22 @@ def es_sueldo(mov: Movimiento) -> bool:
     """True si el movimiento es un pago de sueldos/haberes."""
     return bool(re.search(r'HABERES|SUELDO', _texto_mov(mov), re.IGNORECASE)) and mov.debito > 0
 
+# Socios cuyos retiros (pagos que les hace la empresa) van a su Cuenta Particular.
+# Se identifican por CUIT (único), no por nombre (que puede venir escrito distinto).
+SOCIOS_CUIT = {
+    '23162662449': 'EATON DIEGO MARTIN - Cuenta Particular',
+    '20117996183': 'SANCHEZ EDUARDO OMAR - Cuenta Particular',
+}
+
+# Personas cuyos pagos (débito) el contador imputa a SUELDOS A PAGAR (no a Proveedores).
+# OJO: "honorarios -> sueldos" NO es universal; depende de la persona (Frias/Beeche sí,
+# otros profesionales externos van a Proveedores). Por eso se hace por CUIT, no por concepto.
+# Lista a confirmar/ampliar con el contador.
+SUELDOS_CUIT = {
+    '23215628949': 'SUELDOS A PAGAR',   # Frias Diego Alberto
+    '20401326724': 'SUELDOS A PAGAR',   # Emanuel Nicolas Beeche
+}
+
 def clasificar(res: Resultado, cuenta_sueldos: str = CUENTA_SUELDOS_DEFAULT, mapeo: dict = None,
                cuenta_cobranzas: str = 'Deudores por Venta') -> Resultado:
     """Asigna cuenta contable a cada movimiento.
@@ -1012,6 +1036,15 @@ def clasificar(res: Resultado, cuenta_sueldos: str = CUENTA_SUELDOS_DEFAULT, map
     tabla = (mapeo.get('mapeo', {}) if mapeo else MAPEO_CONTADOR)  # por defecto, diccionario del contador
     for m in res.movimientos:
         if m.categoria: continue
+        # Retiros a socios (pago de la empresa al socio) -> su Cuenta Particular. Por CUIT y solo débito.
+        cuit_norm = re.sub(r'\D', '', str(m.cuit or ''))
+        if m.debito > 0 and cuit_norm in SOCIOS_CUIT:
+            m.categoria = 'RETIRO'; m.cuenta_sugerida = SOCIOS_CUIT[cuit_norm]
+            continue
+        # Honorarios de personas que el contador trata como sueldos (por CUIT, solo débito).
+        if m.debito > 0 and cuit_norm in SUELDOS_CUIT:
+            m.categoria = 'SUELDOS'; m.cuenta_sugerida = SUELDOS_CUIT[cuit_norm]
+            continue
         if tabla:
             for k in (_norm_concepto(m.concepto), _norm_concepto(f"{m.concepto} {m.nombre}")):
                 if k in tabla:
