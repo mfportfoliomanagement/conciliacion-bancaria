@@ -1,0 +1,22 @@
+# Credenciales — NUNCA se suben al repo.
+# La clave del Service Account de Google vive solo en st.secrets (Streamlit Cloud).
+*.json
+credenciales*.json
+credentials*.json
+service_account*.json
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Editor / SO
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
