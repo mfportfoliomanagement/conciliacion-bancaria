@@ -199,9 +199,30 @@ def procesar_cliente(nombre_cliente: str, link_carpeta: str, anio: int, mes: int
     # no solo las que quedaron pendientes).
     wb_papel = X.construir_wb_papel_trabajo(resultados, config['plan_cuentas_x'], asientos, revisar, internas)
     usados = set()
+    hoja_por_res = {}
     for res in resultados:
         ws = wb_papel.create_sheet(C._sanitizar_hoja(res.cuenta, usados))
         C._escribir_hoja(ws, res)
+        hoja_por_res[id(res)] = ws.title
+
+    # Link "ver detalle": desde cada fila de A REVISAR a la fila exacta del
+    # movimiento en la hoja de detalle de su cuenta (_escribir_hoja pone el
+    # primer movimiento en la fila 4, uno por fila, en el mismo orden que
+    # res.movimientos -- por eso se puede calcular la fila sin repetir nada).
+    if 'A REVISAR' in wb_papel.sheetnames:
+        from openpyxl.styles import Font
+        wa = wb_papel['A REVISAR']
+        wa.cell(1, 8, 'VER DETALLE').font = Font(bold=True)
+        for fila_a_revisar, (res_pend, mov_pend, _motivo) in enumerate(revisar, start=2):
+            nombre_hoja = hoja_por_res.get(id(res_pend))
+            indice = next((i for i, m in enumerate(res_pend.movimientos) if m is mov_pend), None)
+            if nombre_hoja is None or indice is None:
+                continue
+            fila_detalle = indice + 4
+            celda = wa.cell(fila_a_revisar, 8, 'Ver fila →')
+            celda.hyperlink = f"#'{nombre_hoja}'!A{fila_detalle}"
+            celda.font = Font(color='0563C1', underline='single')
+        wa.column_dimensions['H'].width = 16
     buf_papel = io.BytesIO()
     wb_papel.save(buf_papel)
 
