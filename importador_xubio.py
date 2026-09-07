@@ -390,10 +390,13 @@ def generar_excel_importador(asientos, path):
     wb.save(path)
 
 
-def generar_excel_papel_trabajo(resultados, plan_cuentas, asientos, revisar, internas, path):
-    """El papel de trabajo -- para revisión humana, NO se sube a Xubio:
-       RESUMEN ASIENTOS (con control debe=haber), A REVISAR, TRANSF.
-       INTERNAS y CONTROL (cobertura global)."""
+def construir_wb_papel_trabajo(resultados, plan_cuentas, asientos, revisar, internas):
+    """Arma (sin guardar) el Workbook del papel de trabajo -- para revisión
+       humana, NO se sube a Xubio: RESUMEN ASIENTOS (con control
+       debe=haber), A REVISAR, TRANSF. INTERNAS y CONTROL (cobertura
+       global). Devuelve el openpyxl.Workbook para que el llamador pueda
+       agregarle más hojas (ej. orquestador.py le agrega el detalle
+       movimiento por movimiento de cada cuenta) antes de guardarlo."""
     import openpyxl
     from openpyxl.styles import Font, PatternFill
 
@@ -472,6 +475,12 @@ def generar_excel_papel_trabajo(resultados, plan_cuentas, asientos, revisar, int
     for col, w in zip('ABCDEFGH', [22, 26, 26, 26, 26, 20, 22, 30]):
         wc.column_dimensions[col].width = w
 
+    return wb
+
+
+def generar_excel_papel_trabajo(resultados, plan_cuentas, asientos, revisar, internas, path):
+    """Como construir_wb_papel_trabajo(), pero ya guardado en `path`."""
+    wb = construir_wb_papel_trabajo(resultados, plan_cuentas, asientos, revisar, internas)
     wb.save(path)
 
 

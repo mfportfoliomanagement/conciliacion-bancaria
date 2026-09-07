@@ -192,8 +192,18 @@ def procesar_cliente(nombre_cliente: str, link_carpeta: str, anio: int, mes: int
 
     buf_importador = io.BytesIO()
     X.generar_excel_importador(asientos, buf_importador)
+
+    # Papel de trabajo: resumen de asientos + pendientes + control, MÁS una
+    # hoja de detalle movimiento por movimiento por cada cuenta bancaria
+    # (el "extracto convertido" completo, para poder revisar cada línea --
+    # no solo las que quedaron pendientes).
+    wb_papel = X.construir_wb_papel_trabajo(resultados, config['plan_cuentas_x'], asientos, revisar, internas)
+    usados = set()
+    for res in resultados:
+        ws = wb_papel.create_sheet(C._sanitizar_hoja(res.cuenta, usados))
+        C._escribir_hoja(ws, res)
     buf_papel = io.BytesIO()
-    X.generar_excel_papel_trabajo(resultados, config['plan_cuentas_x'], asientos, revisar, internas, buf_papel)
+    wb_papel.save(buf_papel)
 
     drive_io.escribir_excel_en_carpeta(sub_periodo, nombre_importador, buf_importador.getvalue())
     drive_io.escribir_excel_en_carpeta(sub_periodo, nombre_papel, buf_papel.getvalue())
