@@ -227,7 +227,13 @@ def construir_asientos(resultados, plan_cuentas: dict):
                                                 f'ambigüedad en) el CBU en el Plan de Cuentas'))
             continue
 
-        # agrupador[(anio, mes, circuito)][nombre_xubio] = [debe, haber]
+        # agrupador[(anio, mes, circuito)][(nombre_xubio, contraparte)] = [debe, haber]
+        # `contraparte` es el nombre que YA trae el propio extracto bancario
+        # para ese movimiento (m.nombre) -- no es una regla nueva: es el
+        # mismo dato de siempre. Probado contra el importador real del
+        # contador: así arma sus líneas (una por proveedor/cliente
+        # identificado en el extracto, y una sola línea junta para los que
+        # no traen nombre), usando la columna ORGANIZACION de Xubio.
         agrupador = defaultdict(lambda: defaultdict(lambda: [0.0, 0.0]))
 
         for m in res.movimientos:
@@ -255,6 +261,14 @@ def construir_asientos(resultados, plan_cuentas: dict):
             # Sociales a pagar'). El Plan de Cuentas solo se usa para el
             # control de existencia (Fase 2) y para el CBU del banco.
             nombre_xubio = cuenta_int
+            # El desglose por nombre (columna ORGANIZACION) solo se hace para
+            # Proveedores -- ahí el nombre que trae el extracto (o el
+            # proveedor ya identificado) es una identidad real y estable.
+            # Se probó también para Cobranzas y no sirvió: las ventas con
+            # tarjeta traen códigos de transacción sin sentido como nombre
+            # (ej. 'TCY318615022 TCTD'), no clientes reales -- ahí se sigue
+            # neteando todo en una sola línea, como el contador.
+            contraparte = (getattr(m, 'nombre', '') or '').strip() if circuito == PRO else ''
 
             if circuito == INTERNO:
                 # Transferencia entre cuentas propias:
@@ -268,7 +282,7 @@ def construir_asientos(resultados, plan_cuentas: dict):
                                                         'recibida, pero no se pudo identificar '
                                                         'sin ambigüedad la otra cuenta propia'))
                         continue
-                    slot = agrupador[(clave_mes[0], clave_mes[1], TRP)][contra]
+                    slot = agrupador[(clave_mes[0], clave_mes[1], TRP)][(contra, '')]
                     slot[1] = _r2(slot[1] + _r2(m.credito))   # HABER de la otra cuenta
                 else:
                     internas_global.append((res, m))          # enviada: se excluye
@@ -277,7 +291,7 @@ def construir_asientos(resultados, plan_cuentas: dict):
                 revisar_global.append((res, m, f'circuito a revisar: {cuenta_int}'))
                 continue
 
-            slot = agrupador[(clave_mes[0], clave_mes[1], circuito)][nombre_xubio]
+            slot = agrupador[(clave_mes[0], clave_mes[1], circuito)][(nombre_xubio, contraparte)]
             slot[0] = _r2(slot[0] + _r2(m.debito))
             slot[1] = _r2(slot[1] + _r2(m.credito))
 
@@ -289,23 +303,27 @@ def construir_asientos(resultados, plan_cuentas: dict):
             suf = f"{mes:02d}.{anio}"
             concepto = f"{circuito} - BCO. {banco} {etiqueta_cta} del mes {suf}".replace('  ', ' ')
 
-            # NETEADO: una sola línea por cuenta (debe - haber). Si el neto queda en 0,
-            # la cuenta se cancela sola y no se lista.
+            # NETEADO: una línea por cuenta+contraparte (debe - haber). Si el
+            # neto queda en 0, se cancela sola y no se lista. Cada línea
+            # lleva (cuenta, debe, haber, organizacion) -- organizacion es el
+            # nombre que trajo el extracto para esa contraparte, o '' si el
+            # extracto no informó ninguno (esos quedan juntos en una sola
+            # línea sin nombre, como en el importador real del contador).
             lineas = []
             neto_cuentas = 0.0   # suma de (debe - haber) de todas las cuentas del circuito
-            for nombre_xubio, (debe, haber) in cuentas.items():
+            for (nombre_xubio, contraparte), (debe, haber) in cuentas.items():
                 neto = _r2(debe - haber)
                 if neto > 0:
-                    lineas.append((nombre_xubio, neto, 0.0))
+                    lineas.append((nombre_xubio, neto, 0.0, contraparte))
                 elif neto < 0:
-                    lineas.append((nombre_xubio, 0.0, _r2(-neto)))
+                    lineas.append((nombre_xubio, 0.0, _r2(-neto), contraparte))
                 neto_cuentas = _r2(neto_cuentas + neto)
 
             # Contrapartida banco (también neteada), para que el asiento cierre
             if neto_cuentas > 0:
-                lineas.append((banco, 0.0, neto_cuentas))
+                lineas.append((banco, 0.0, neto_cuentas, ''))
             elif neto_cuentas < 0:
-                lineas.append((banco, _r2(-neto_cuentas), 0.0))
+                lineas.append((banco, _r2(-neto_cuentas), 0.0, ''))
 
             if lineas:
                 asientos.append(dict(fecha=fecha, concepto=concepto, banco=banco,
@@ -387,9 +405,9 @@ def generar_excel_importador(asientos, path):
         ws.cell(1, c).font = Font(bold=True)
     for a in asientos:
         ws.append([a['fecha'].strftime('%d/%m/%Y'), a['concepto'], 'default', '', '', '', '', '', ''])
-        for (cuenta, debe, haber) in a['lineas']:
+        for (cuenta, debe, haber, org) in a['lineas']:
             ws.append(['', '', '', cuenta,
-                       debe if debe > 0 else '', haber if haber > 0 else '', '', '', ''])
+                       debe if debe > 0 else '', haber if haber > 0 else '', org, '', ''])
     for col, w in zip('ABCDEFGHI', [12, 55, 16, 40, 15, 15, 14, 14, 30]):
         ws.column_dimensions[col].width = w
     wb.save(path)
@@ -410,22 +428,22 @@ def construir_wb_papel_trabajo(resultados, plan_cuentas, asientos, revisar, inte
     # ---------- Hoja RESUMEN ASIENTOS ----------
     wr = wb.active
     wr.title = 'RESUMEN ASIENTOS'
-    wr.append(['FECHA', 'CONCEPTO', 'NOMBRE CUENTA', 'DEBE', 'HABER', 'CONTROL'])
-    for c in range(1, 7):
+    wr.append(['FECHA', 'CONCEPTO', 'NOMBRE CUENTA', 'ORGANIZACION', 'DEBE', 'HABER', 'CONTROL'])
+    for c in range(1, 8):
         wr.cell(1, c).font = Font(bold=True)
     amarillo = PatternFill('solid', fgColor='FFF2CC')
     for a in asientos:
         d, h, ctrl = _control_asiento(a)
-        wr.append([a['fecha'].strftime('%d/%m/%Y'), a['concepto'], '', '', '', ''])
-        for (cuenta, debe, haber) in a['lineas']:
-            wr.append(['', '', cuenta, debe if debe > 0 else '', haber if haber > 0 else '', ''])
-        fila_total = ['', '', 'TOTAL', d, h, ctrl]
+        wr.append([a['fecha'].strftime('%d/%m/%Y'), a['concepto'], '', '', '', '', ''])
+        for (cuenta, debe, haber, org) in a['lineas']:
+            wr.append(['', '', cuenta, org, debe if debe > 0 else '', haber if haber > 0 else '', ''])
+        fila_total = ['', '', 'TOTAL', '', d, h, ctrl]
         wr.append(fila_total)
         r = wr.max_row
-        for c in range(3, 7):
+        for c in range(3, 8):
             wr.cell(r, c).font = Font(bold=True)
             wr.cell(r, c).fill = amarillo
-    for col, w in zip('ABCDEF', [12, 55, 40, 15, 15, 12]):
+    for col, w in zip('ABCDEFG', [12, 55, 40, 30, 15, 15, 12]):
         wr.column_dimensions[col].width = w
 
     # ---------- Hoja A REVISAR (movimientos sin circuito/cuenta/banco) ----------
