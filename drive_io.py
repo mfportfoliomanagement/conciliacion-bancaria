@@ -34,10 +34,12 @@ Sale de una de estas dos fuentes, en este orden:
 from __future__ import annotations
 
 import difflib
+import functools
 import io
 import json
 import os
 import re
+import time
 import unicodedata
 from typing import Dict, List, Optional
 
@@ -45,6 +47,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from google.oauth2.credentials import Credentials as CredencialesUsuario
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 _SCOPES = [
@@ -97,6 +100,50 @@ def _clientes():
         _gc = gspread.authorize(_creds)
         _drive = build("drive", "v3", credentials=_creds, cache_discovery=False)
     return _gc, _drive
+
+
+# ---------------------------------------------------------------------------
+# Reintentos ante errores TRANSITORIOS de Google (límite de lecturas por
+# minuto, servidor ocupado) -- nunca ante errores reales (permiso denegado,
+# archivo inexistente). Sin esto, un pico de uso (varios clientes seguidos
+# en el modo lote, o probar y usar la app al mismo tiempo) puede tirar la
+# app entera por un error que se hubiera resuelto solo unos segundos después.
+# ---------------------------------------------------------------------------
+def _codigo_http(e) -> Optional[int]:
+    if isinstance(e, gspread.exceptions.APIError):
+        try:
+            return e.response.status_code
+        except Exception:
+            return None
+    if isinstance(e, HttpError):
+        return e.resp.status if getattr(e, "resp", None) else None
+    return None
+
+
+def _es_error_transitorio(e) -> bool:
+    """True si vale la pena reintentar (límite de lecturas, servidor
+    ocupado). False si es un error real -- ahí no hay que insistir."""
+    return _codigo_http(e) in (429, 500, 502, 503, 504)
+
+
+def _reintentable(func):
+    """Decorador: si `func` falla con un error transitorio de Google,
+    reintenta unas pocas veces con espera creciente antes de rendirse."""
+    @functools.wraps(func)
+    def envoltura(*args, intentos=4, espera_inicial=2, **kwargs):
+        espera = espera_inicial
+        for intento in range(1, intentos + 1):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                if intento == intentos or not _es_error_transitorio(e):
+                    raise
+                print(f"[drive_io] Google devolvió un error transitorio "
+                      f"({_codigo_http(e)}) en {func.__name__} -- "
+                      f"reintento {intento}/{intentos} en {espera}s...")
+                time.sleep(espera)
+                espera *= 2
+    return envoltura
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +235,7 @@ def _extraer_id_de_link(link_o_id: str) -> str:
     return link_o_id.strip()
 
 
+@_reintentable
 def abrir_carpeta_cliente(link_o_id: str) -> str:
     """Entra a la carpeta del cliente y devuelve su ID de Drive, validando
     que exista y que la cuenta de servicio tenga acceso."""
@@ -201,6 +249,7 @@ def abrir_carpeta_cliente(link_o_id: str) -> str:
     return folder_id
 
 
+@_reintentable
 def abrir_archivo_por_id(archivo_id: str) -> dict:
     """Abre un archivo de Drive directamente por su ID (para archivos que
     NO viven dentro de la carpeta de un cliente, ej. el Maestro de
@@ -211,6 +260,7 @@ def abrir_archivo_por_id(archivo_id: str) -> dict:
     ).execute()
 
 
+@_reintentable
 def buscar_subcarpeta(carpeta_id: str, nombre: str) -> Optional[str]:
     """Busca una subcarpeta por nombre (tolerante a mayúsculas/acentos/
     espacios) dentro de `carpeta_id`. Devuelve su ID de Drive, o None si
@@ -232,6 +282,7 @@ def buscar_subcarpeta(carpeta_id: str, nombre: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # Buscar un archivo dentro de la carpeta por su nombre base
 # ---------------------------------------------------------------------------
+@_reintentable
 def buscar_archivo_por_nombre_base(carpeta_id: str, nombre_base: str, umbral: float = 0.85) -> Optional[dict]:
     """Busca, dentro de la carpeta del cliente, el archivo cuyo nombre
     corresponde a `nombre_base` (el resto es el sufijo del cliente, ej.
@@ -280,6 +331,7 @@ def buscar_archivo_por_nombre_base(carpeta_id: str, nombre_base: str, umbral: fl
 # ---------------------------------------------------------------------------
 # Leer una solapa de un Google Sheet como lista de dicts
 # ---------------------------------------------------------------------------
+@_reintentable
 def leer_sheet(archivo: dict, solapa: str) -> List[Dict[str, str]]:
     """Lee la solapa `solapa` del Google Sheet `archivo` (el dict que
     devuelve buscar_archivo_por_nombre_base). Devuelve una lista de dicts:
@@ -295,6 +347,7 @@ def leer_sheet(archivo: dict, solapa: str) -> List[Dict[str, str]]:
     return ws.get_all_records()  # usa la fila 1 como encabezado
 
 
+@_reintentable
 def leer_sheet_crudo(archivo: dict, solapa: str) -> List[List[str]]:
     """Como leer_sheet, pero devuelve las filas TAL CUAL (lista de listas),
     sin usar la fila 1 como encabezado. Sirve para solapas donde el
@@ -309,6 +362,7 @@ def leer_sheet_crudo(archivo: dict, solapa: str) -> List[List[str]]:
     return ws.get_all_values()
 
 
+@_reintentable
 def listar_solapas(archivo: dict) -> List[str]:
     """Nombres de todas las solapas de un Sheet (para debug / validar)."""
     gc, _ = _clientes()
@@ -319,6 +373,7 @@ def listar_solapas(archivo: dict) -> List[str]:
 # ---------------------------------------------------------------------------
 # Bajar un PDF en bytes (para pasárselo directo a pdfplumber)
 # ---------------------------------------------------------------------------
+@_reintentable
 def descargar_pdf(archivo: dict) -> bytes:
     """Baja los BYTES crudos del PDF (nunca base64, nunca texto). Se le
     puede pasar directo a pdfplumber:
@@ -333,6 +388,7 @@ def descargar_pdf(archivo: dict) -> bytes:
     return buf.getvalue()
 
 
+@_reintentable
 def listar_pdfs(carpeta_id: str) -> List[dict]:
     """Lista los PDF sueltos dentro de la carpeta del cliente (útil para el
     modo 'lote' de la Fase 4)."""
@@ -346,6 +402,7 @@ def listar_pdfs(carpeta_id: str) -> List[dict]:
     return resp.get("files", [])
 
 
+@_reintentable
 def existe_archivo(carpeta_id: str, nombre: str) -> bool:
     """True si ya hay un archivo con ese nombre (tolerante a mayúsculas/
     acentos/espacios) en la carpeta. Se usa para no reprocesar un cliente
@@ -364,6 +421,7 @@ def existe_archivo(carpeta_id: str, nombre: str) -> bool:
 # ---------------------------------------------------------------------------
 # Subir el Excel de salida a la carpeta del cliente
 # ---------------------------------------------------------------------------
+@_reintentable
 def escribir_excel_en_carpeta(carpeta_id: str, nombre: str, contenido: bytes) -> str:
     """Sube un .xlsx a la carpeta del cliente, actuando como un USUARIO
     REAL (no la cuenta de servicio) -- ver el bloque de credenciales de
