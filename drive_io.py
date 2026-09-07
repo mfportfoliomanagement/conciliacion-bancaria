@@ -33,6 +33,7 @@ Sale de una de estas dos fuentes, en este orden:
 """
 from __future__ import annotations
 
+import difflib
 import io
 import json
 import os
@@ -138,11 +139,16 @@ def abrir_carpeta_cliente(link_o_id: str) -> str:
 # ---------------------------------------------------------------------------
 # Buscar un archivo dentro de la carpeta por su nombre base
 # ---------------------------------------------------------------------------
-def buscar_archivo_por_nombre_base(carpeta_id: str, nombre_base: str) -> Optional[dict]:
+def buscar_archivo_por_nombre_base(carpeta_id: str, nombre_base: str, umbral: float = 0.85) -> Optional[dict]:
     """Busca, dentro de la carpeta del cliente, el archivo cuyo nombre
-    EMPIEZA con `nombre_base` (el resto es el sufijo del cliente, ej.
+    corresponde a `nombre_base` (el resto es el sufijo del cliente, ej.
     '+ Venezuela'). Devuelve {'id', 'name', 'mimeType'} o None si no
-    aparece (el llamador decide qué hacer — nunca se inventa un archivo)."""
+    aparece (el llamador decide qué hacer — nunca se inventa un archivo).
+
+    Primero prueba "empieza con" (caso normal). Si nada matchea así, tolera
+    pequeños errores de tipeo en el nombre del archivo (ej. una letra de
+    menos) comparando por similitud de texto — los archivos los nombran
+    personas y a veces se equivocan al escribir el nombre base."""
     _, drive = _clientes()
     resp = drive.files().list(
         q=f"'{carpeta_id}' in parents and trashed = false",
@@ -150,15 +156,30 @@ def buscar_archivo_por_nombre_base(carpeta_id: str, nombre_base: str) -> Optiona
         supportsAllDrives=True,
         includeItemsFromAllDrives=True,
     ).execute()
+    archivos = resp.get("files", [])
     objetivo = _normalizar(nombre_base)
-    candidatos = [
-        f for f in resp.get("files", [])
-        if _normalizar(f["name"]).startswith(objetivo)
-    ]
+
+    candidatos = [f for f in archivos if _normalizar(f["name"]).startswith(objetivo)]
+
+    if not candidatos:
+        # Nadie matcheo exacto -> probamos tolerando errores de tipeo chicos
+        # en el nombre del archivo (comparamos el objetivo contra el
+        # comienzo del nombre real, con la misma cantidad de caracteres).
+        puntajes = []
+        for f in archivos:
+            nombre_norm = _normalizar(f["name"])
+            recorte = nombre_norm[: len(objetivo) + 5]
+            ratio = difflib.SequenceMatcher(None, objetivo, recorte).ratio()
+            if ratio >= umbral:
+                puntajes.append((ratio, f))
+        if puntajes:
+            puntajes.sort(key=lambda t: -t[0])
+            candidatos = [f for _, f in puntajes]
+
     if not candidatos:
         return None
     if len(candidatos) > 1:
-        print(f"[drive_io] Aviso: hay {len(candidatos)} archivos que empiezan "
+        print(f"[drive_io] Aviso: hay {len(candidatos)} archivos que coinciden "
               f"con '{nombre_base}' en la carpeta; uso '{candidatos[0]['name']}'.")
     return candidatos[0]
 
