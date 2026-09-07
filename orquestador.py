@@ -211,6 +211,7 @@ def procesar_cliente(nombre_cliente: str, link_carpeta: str, anio: int, mes: int
     # res.movimientos -- por eso se puede calcular la fila sin repetir nada).
     if 'A REVISAR' in wb_papel.sheetnames:
         from openpyxl.styles import Font
+        from openpyxl.worksheet.hyperlink import Hyperlink
         wa = wb_papel['A REVISAR']
         wa.cell(1, 8, 'VER DETALLE').font = Font(bold=True)
         for fila_a_revisar, (res_pend, mov_pend, _motivo) in enumerate(revisar, start=2):
@@ -220,7 +221,11 @@ def procesar_cliente(nombre_cliente: str, link_carpeta: str, anio: int, mes: int
                 continue
             fila_detalle = indice + 4
             celda = wa.cell(fila_a_revisar, 8, 'Ver fila →')
-            celda.hyperlink = f"#'{nombre_hoja}'!A{fila_detalle}"
+            # location= (no target=) es el link INTERNO "de verdad" -- sin
+            # relación externa. La forma target="#'Hoja'!A1" queda marcada
+            # como link externo en el xlsx: Excel la tolera, pero Google
+            # Sheets no la sigue.
+            celda.hyperlink = Hyperlink(ref=celda.coordinate, location=f"'{nombre_hoja}'!A{fila_detalle}")
             celda.font = Font(color='0563C1', underline='single')
         wa.column_dimensions['H'].width = 16
     buf_papel = io.BytesIO()
