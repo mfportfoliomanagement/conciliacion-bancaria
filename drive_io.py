@@ -43,6 +43,7 @@ from typing import Dict, List, Optional
 
 import gspread
 from google.oauth2.service_account import Credentials
+from google.oauth2.credentials import Credentials as CredencialesUsuario
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
@@ -99,6 +100,70 @@ def _clientes():
 
 
 # ---------------------------------------------------------------------------
+# Credenciales de un USUARIO REAL (no la cuenta de servicio), solo para
+# ESCRIBIR archivos en Drive.
+#
+# Las cuentas de servicio no tienen cuota de almacenamiento propia: Google
+# rechaza que creen archivos nuevos (.xlsx, PDFs, etc.) dentro de una
+# carpeta de Drive normal ("Mi unidad"), aunque tengan permiso de Editor
+# sobre esa carpeta. Por eso, para subir el resultado a la carpeta del
+# cliente, el bot actúa como un usuario real (autorizado una única vez —
+# ver el script autorizar_google_drive.py), usando el espacio de ESE
+# usuario. La lectura (Sheets, PDFs, listar archivos) sigue igual, con la
+# cuenta de servicio.
+#
+# Se arma igual que las credenciales de servicio: st.secrets primero,
+# variable de entorno después. Es OPCIONAL -- si no está configurado,
+# escribir_excel_en_carpeta() tira un error claro en vez de fallar
+# confuso contra Google.
+# ---------------------------------------------------------------------------
+_creds_usuario = None
+_drive_usuario = None
+
+
+def _cargar_credenciales_usuario():
+    """Arma las credenciales OAuth de un usuario real a partir de un
+    refresh_token ya autorizado. Devuelve None si no está configurado
+    (no es un error: el resto del módulo sigue funcionando para lectura)."""
+    info = None
+    try:
+        import streamlit as st
+        if "google_oauth_usuario" in st.secrets:
+            info = dict(st.secrets["google_oauth_usuario"])
+    except Exception:
+        pass
+
+    if info is None:
+        raw = os.environ.get("GOOGLE_OAUTH_USUARIO_JSON")
+        if raw:
+            info = json.loads(raw)
+
+    if info is None:
+        return None
+
+    return CredencialesUsuario(
+        token=None,
+        refresh_token=info["refresh_token"],
+        client_id=info["client_id"],
+        client_secret=info["client_secret"],
+        token_uri="https://oauth2.googleapis.com/token",
+        scopes=["https://www.googleapis.com/auth/drive"],
+    )
+
+
+def _cliente_drive_usuario():
+    """Servicio de Drive autenticado como el usuario real, o None si no
+    está configurado (ver _cargar_credenciales_usuario)."""
+    global _creds_usuario, _drive_usuario
+    if _drive_usuario is None:
+        _creds_usuario = _cargar_credenciales_usuario()
+        if _creds_usuario is None:
+            return None
+        _drive_usuario = build("drive", "v3", credentials=_creds_usuario, cache_discovery=False)
+    return _drive_usuario
+
+
+# ---------------------------------------------------------------------------
 # Comparación tolerante de NOMBRES DE ARCHIVO (mayúsculas/acentos/espacios).
 # Ojo: esto es solo para encontrar archivos por nombre en Drive. La
 # comparación tolerante de CONCEPTOS/CUENTAS de negocio vive en
@@ -134,6 +199,34 @@ def abrir_carpeta_cliente(link_o_id: str) -> str:
     if meta.get("mimeType") != _MIME_FOLDER:
         raise ValueError(f"El link/ID '{link_o_id}' no apunta a una carpeta de Drive.")
     return folder_id
+
+
+def abrir_archivo_por_id(archivo_id: str) -> dict:
+    """Abre un archivo de Drive directamente por su ID (para archivos que
+    NO viven dentro de la carpeta de un cliente, ej. el Maestro de
+    Clientes). Devuelve {'id', 'name', 'mimeType'}."""
+    _, drive = _clientes()
+    return drive.files().get(
+        fileId=archivo_id, fields="id, name, mimeType", supportsAllDrives=True
+    ).execute()
+
+
+def buscar_subcarpeta(carpeta_id: str, nombre: str) -> Optional[str]:
+    """Busca una subcarpeta por nombre (tolerante a mayúsculas/acentos/
+    espacios) dentro de `carpeta_id`. Devuelve su ID de Drive, o None si
+    no existe (ej. todavía no se cargó nada para ese año/mes)."""
+    _, drive = _clientes()
+    resp = drive.files().list(
+        q=f"'{carpeta_id}' in parents and trashed = false and mimeType = '{_MIME_FOLDER}'",
+        fields="files(id, name)",
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute()
+    objetivo = _normalizar(nombre)
+    for f in resp.get("files", []):
+        if _normalizar(f["name"]) == objetivo:
+            return f["id"]
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +295,20 @@ def leer_sheet(archivo: dict, solapa: str) -> List[Dict[str, str]]:
     return ws.get_all_records()  # usa la fila 1 como encabezado
 
 
+def leer_sheet_crudo(archivo: dict, solapa: str) -> List[List[str]]:
+    """Como leer_sheet, pero devuelve las filas TAL CUAL (lista de listas),
+    sin usar la fila 1 como encabezado. Sirve para solapas donde el
+    encabezado no es único (ej. columnas repetidas, como BANCOS del
+    Maestro de Clientes) y por eso leer_sheet() no se puede usar."""
+    gc, _ = _clientes()
+    sh = gc.open_by_key(archivo["id"])
+    try:
+        ws = sh.worksheet(solapa)
+    except gspread.exceptions.WorksheetNotFound:
+        return []
+    return ws.get_all_values()
+
+
 def listar_solapas(archivo: dict) -> List[str]:
     """Nombres de todas las solapas de un Sheet (para debug / validar)."""
     gc, _ = _clientes()
@@ -239,14 +346,42 @@ def listar_pdfs(carpeta_id: str) -> List[dict]:
     return resp.get("files", [])
 
 
+def existe_archivo(carpeta_id: str, nombre: str) -> bool:
+    """True si ya hay un archivo con ese nombre (tolerante a mayúsculas/
+    acentos/espacios) en la carpeta. Se usa para no reprocesar un cliente
+    cuya salida de un período ya se generó (modo lote retomable)."""
+    _, drive = _clientes()
+    resp = drive.files().list(
+        q=f"'{carpeta_id}' in parents and trashed = false",
+        fields="files(name)",
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute()
+    objetivo = _normalizar(nombre)
+    return any(_normalizar(f["name"]) == objetivo for f in resp.get("files", []))
+
+
 # ---------------------------------------------------------------------------
 # Subir el Excel de salida a la carpeta del cliente
 # ---------------------------------------------------------------------------
 def escribir_excel_en_carpeta(carpeta_id: str, nombre: str, contenido: bytes) -> str:
-    """Sube un .xlsx a la carpeta del cliente. Si ya existe un archivo con
-    ese nombre en esa carpeta, lo REEMPLAZA (mismo ID de Drive, no duplica).
+    """Sube un .xlsx a la carpeta del cliente, actuando como un USUARIO
+    REAL (no la cuenta de servicio) -- ver el bloque de credenciales de
+    usuario más arriba en este archivo; las cuentas de servicio no tienen
+    cuota de almacenamiento propia y Google rechaza que creen archivos
+    nuevos en una carpeta de Drive normal. Si ya existe un archivo con ese
+    nombre en esa carpeta, lo REEMPLAZA (mismo ID de Drive, no duplica).
     Devuelve el ID del archivo en Drive."""
-    _, drive = _clientes()
+    drive = _cliente_drive_usuario()
+    if drive is None:
+        raise RuntimeError(
+            "Para subir archivos a Drive hace falta la autorización de un "
+            "usuario real (la cuenta de servicio no tiene cuota de "
+            "almacenamiento propia). Corré autorizar_google_drive.py una vez "
+            "y configurá st.secrets['google_oauth_usuario'] (o la variable de "
+            "entorno GOOGLE_OAUTH_USUARIO_JSON) con client_id/client_secret/"
+            "refresh_token."
+        )
     if not nombre.lower().endswith(".xlsx"):
         nombre += ".xlsx"
     media = MediaIoBaseUpload(io.BytesIO(contenido), mimetype=_MIME_XLSX, resumable=True)

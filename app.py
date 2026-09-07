@@ -1,20 +1,32 @@
 # -*- coding: utf-8 -*-
 """
-App web de conciliación bancaria.
-Flujo para el empleado:  subir el PDF del banco  ->  descargar el Excel conciliado.
-No hay que elegir cliente ni subir ningún otro archivo: los criterios contables
-(cómo imputar cada concepto a su cuenta) ya están dentro del programa.
+App web de conciliación bancaria — Fase 4.
 
-Bancos soportados: Galicia, BBVA, Macro, Ciudad, Comafi, Supervielle.
+Dos pestañas:
+  - Lote: recorre TODOS los clientes del Maestro para un período.
+  - Individual: procesa un cliente puntual.
+
+Esta app no tiene ninguna regla de negocio de ningún cliente: todo el
+criterio de clasificación sale de los 4 archivos que cada cliente tiene en
+su propia carpeta de Drive (ver conversor_extractos.py / importador_xubio.py
+/ orquestador.py). Acá solo hay interfaz.
+
 Correr local:  streamlit run app.py     Requisitos: pip install -r requirements.txt
 """
-import os, tempfile
+import datetime
+import os
+
 import streamlit as st
-import conversor_extractos as C
-import importador_xubio as IX
 
-st.set_page_config(page_title="Conciliación Bancaria", page_icon="🏦", layout="centered")
+import drive_io
+import orquestador as O
 
+st.set_page_config(page_title="Conciliación Bancaria", page_icon="🏦", layout="wide")
+
+
+# ---------------------------------------------------------------------------
+# Acceso
+# ---------------------------------------------------------------------------
 def acceso_ok() -> bool:
     if st.session_state.get("auth_ok"):
         return True
@@ -28,78 +40,150 @@ def acceso_ok() -> bool:
         if correcta is None:
             st.warning("Falta configurar 'app_password' en los secrets de la app.")
         elif pw == correcta:
-            st.session_state["auth_ok"] = True; st.rerun()
+            st.session_state["auth_ok"] = True
+            st.rerun()
         else:
             st.error("Contraseña incorrecta.")
     return False
 
+
 if not acceso_ok():
     st.stop()
 
-st.title("🏦 Conciliación Bancaria")
-st.caption("Subí el extracto del banco en **PDF** y descargá el Excel conciliado "
-           "y el importador de asientos para Xubio. "
-           "Bancos: Galicia, BBVA, Macro, Ciudad, Comafi, Supervielle.")
 
-archivos = st.file_uploader("Extracto(s) en PDF", type=["pdf"], accept_multiple_files=True)
-
-for arch in archivos or []:
-    st.divider(); st.subheader(f"📄 {arch.name}")
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(arch.getbuffer()); ruta_pdf = tmp.name
+# ---------------------------------------------------------------------------
+# ID del Maestro de Clientes (infraestructura del sistema, no dato de un
+# cliente puntual -- por eso sale de los secrets, igual que las credenciales).
+# ---------------------------------------------------------------------------
+def _maestro_clientes_id() -> str:
     try:
-        resultados = C.leer_extracto(ruta_pdf)
-    except Exception as e:
-        st.error(f"No pude procesar el PDF (¿banco soportado?). Detalle: {e}")
-        os.unlink(ruta_pdf); continue
+        v = st.secrets["maestro_clientes_id"]
+        if v:
+            return v
+    except Exception:
+        pass
+    v = os.environ.get("MAESTRO_CLIENTES_ID")
+    if v:
+        return v
+    st.error("Falta configurar 'maestro_clientes_id' en los secrets de la app "
+              "(el ID del Google Sheet MAESTRO_CLIENTES -- la parte del link "
+              "entre '/d/' y '/edit').")
+    st.stop()
 
-    st.write(f"**Banco:** {resultados[0].banco}  ·  **Cuentas:** {len(resultados)}")
-    todo_ok = True
-    for res in resultados:
-        C.clasificar(res)                      # criterios del contador, ya incorporados
-        ctrl = C.verificar_control(res); ok = ctrl["ok"]; todo_ok = todo_ok and ok
-        tot = len(res.movimientos); con = sum(1 for m in res.movimientos if m.cuenta_sugerida)
-        c1, c2, c3 = st.columns(3)
-        c1.metric(f"Cta {res.cuenta}", f"{tot} movs")
-        c2.metric("Control de saldo", "OK ✓" if ok else "REVISAR ✗", f"dif {ctrl['diferencia']:.2f}")
-        c3.metric("Con cuenta contable", f"{con}/{tot}")
-        if not ok:
-            st.warning(f"⚠️ La cuenta {res.cuenta} no cuadra (dif {ctrl['diferencia']:.2f}). "
-                       "Revisá antes de importar a Xubio.")
-        if tot - con:
-            st.caption(f"{tot - con} movimiento(s) sin cuenta asignada — marcados para revisión "
-                       "manual (p. ej. pagos de AFIP que requieren el VEP, o conceptos nuevos).")
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmpx:
-        ruta_xlsx = tmpx.name
-    C.exportar_excel(resultados, ruta_xlsx)
-    with open(ruta_xlsx, "rb") as fh:
-        data = fh.read()
-    st.download_button("⬇️ Descargar Excel conciliado", data=data,
-                       file_name=arch.name.rsplit('.', 1)[0] + " - conciliado.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    if todo_ok:
-        st.success("Todas las cuentas cerraron el control de saldo en cero ✓")
+# ---------------------------------------------------------------------------
+# Ayudantes de UI
+# ---------------------------------------------------------------------------
+def _mostrar_reporte(rep: dict) -> None:
+    if rep.get("saltado"):
+        st.info(f"⏭️ {rep['motivo']}")
+        return
+    if not rep["ok"]:
+        st.warning(f"⚠️ {rep['motivo']}")
+        return
 
-    # ---- CAPA 3: importador de asientos para Xubio ----
-    st.markdown("**📘 Asientos para Xubio**")
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmpimp:
-        ruta_imp = tmpimp.name
-    IX.generar_excel(resultados, ruta_imp)
-    cobertura = IX.control_cobertura(resultados)
-    for r in cobertura:
-        if r["completo"]:
-            st.caption(f"Cta {r['cuenta']}: importador COMPLETO ✓ — refleja todo el extracto.")
+    st.success(f"✅ Procesado — {len(rep['pdfs_procesados'])} PDF(s), "
+               f"{rep.get('pendientes', 0)} movimiento(s) pendiente(s) de imputar.")
+    for nombre in rep["pdfs_procesados"]:
+        st.caption(f"📄 {nombre}")
+    for nombre, error in rep["pdfs_con_error"]:
+        st.error(f"No pude procesar {nombre}: {error}")
+
+    cols = st.columns(max(len(rep["controles"]), 1))
+    for c, ctrl in zip(cols, rep["controles"]):
+        c.metric(f"Control saldo — Cta {ctrl['cuenta']}",
+                  "OK ✓" if ctrl["ok"] else "REVISAR ✗",
+                  f"dif {ctrl['diferencia']:,.2f}")
+
+    for cob in rep["cobertura"]:
+        if cob["completo"]:
+            st.caption(f"Cta {cob['cuenta']} ({cob['banco']}): importador COMPLETO ✓")
         else:
-            st.warning(f"⚠️ Cta {r['cuenta']}: importador INCOMPLETO — faltan imputar "
-                       f"${r['faltan_monto']:,.2f} en {r['faltan_movimientos']} movimiento(s). "
-                       "Resolvé la hoja **A REVISAR** antes de subirlo a Xubio.")
-    with open(ruta_imp, "rb") as fh:
-        data_imp = fh.read()
-    st.download_button("⬇️ Descargar importador de asientos (Xubio)", data=data_imp,
-                       file_name=arch.name.rsplit('.', 1)[0] + " - importador asientos.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    st.caption("El importador es un borrador de arranque: mientras el control diga INCOMPLETO, "
-               "primero resolvé lo que quede en la hoja A REVISAR antes de importarlo a Xubio.")
+            st.caption(f"⚠️ Cta {cob['cuenta']} ({cob['banco']}): faltan imputar "
+                       f"${cob['faltan_monto']:,.2f} en {cob['faltan_movimientos']} "
+                       f"movimiento(s) — ver hoja A REVISAR del papel de trabajo.")
 
-    os.unlink(ruta_pdf); os.unlink(ruta_xlsx); os.unlink(ruta_imp)
+
+MESES_LABEL = [m.title() for m in O.MESES_ES]
+
+st.title("🏦 Conciliación Bancaria")
+st.caption("Todo el criterio de clasificación sale de las planillas de cada cliente en Drive — "
+           "esta app no decide nada por su cuenta.")
+
+tab_lote, tab_individual = st.tabs(["📦 Procesar en lote", "👤 Cliente individual"])
+
+# ---------------------------------------------------------------------------
+# Pestaña LOTE
+# ---------------------------------------------------------------------------
+with tab_lote:
+    st.subheader("Procesar todos los clientes de un período")
+    c1, c2, c3 = st.columns([1, 1, 1])
+    mes_lote = c1.selectbox("Mes", options=list(range(1, 13)),
+                             format_func=lambda m: MESES_LABEL[m - 1],
+                             index=datetime.date.today().month - 1, key="lote_mes")
+    anio_lote = c2.number_input("Año", min_value=2020, max_value=2100,
+                                 value=datetime.date.today().year, step=1, key="lote_anio")
+    forzar_lote = c3.checkbox("Reprocesar aunque ya esté hecho", value=False, key="lote_forzar")
+
+    if st.button("▶️ Procesar lote", key="lote_run"):
+        maestro_id = _maestro_clientes_id()
+        clientes = O.listar_clientes(maestro_id)
+        if not clientes:
+            st.warning("El Maestro de Clientes no tiene ningún cliente cargado todavía.")
+        else:
+            progreso = st.progress(0.0, text=f"0 / {len(clientes)}")
+            reportes = []
+            for i, cliente in enumerate(clientes):
+                with st.expander(f"{cliente['razon_social']}", expanded=False):
+                    if not cliente["link_carpeta"]:
+                        st.info("⏭️ Sin LINK CARPETA cargado en el Maestro — salteado.")
+                        reportes.append(dict(cliente=cliente["razon_social"], ok=False, saltado=False))
+                    else:
+                        rep = O.procesar_cliente(cliente["razon_social"], cliente["link_carpeta"],
+                                                  int(anio_lote), int(mes_lote), forzar=forzar_lote)
+                        reportes.append(rep)
+                        _mostrar_reporte(rep)
+                progreso.progress((i + 1) / len(clientes), text=f"{i + 1} / {len(clientes)}")
+
+            ok = sum(1 for r in reportes if r["ok"] and not r.get("saltado"))
+            saltados = sum(1 for r in reportes if r.get("saltado"))
+            con_error = sum(1 for r in reportes if not r["ok"])
+            st.divider()
+            st.markdown(f"**Lote terminado.** Procesados: {ok} · Salteados (ya estaban): "
+                        f"{saltados} · Con problema: {con_error}")
+
+# ---------------------------------------------------------------------------
+# Pestaña INDIVIDUAL
+# ---------------------------------------------------------------------------
+with tab_individual:
+    st.subheader("Procesar un cliente puntual")
+    maestro_id_ind = _maestro_clientes_id()
+    clientes_ind = O.listar_clientes(maestro_id_ind)
+
+    if not clientes_ind:
+        st.warning("El Maestro de Clientes no tiene ningún cliente cargado todavía.")
+    else:
+        nombres = [c["razon_social"] for c in clientes_ind]
+        c1, c2, c3 = st.columns([2, 1, 1])
+        elegido = c1.selectbox("Cliente", options=nombres, key="ind_cliente")
+        mes_ind = c2.selectbox("Mes", options=list(range(1, 13)),
+                                format_func=lambda m: MESES_LABEL[m - 1],
+                                index=datetime.date.today().month - 1, key="ind_mes")
+        anio_ind = c3.number_input("Año", min_value=2020, max_value=2100,
+                                    value=datetime.date.today().year, step=1, key="ind_anio")
+
+        cliente_data = next(c for c in clientes_ind if c["razon_social"] == elegido)
+        bancos_declarados = O.leer_bancos_maestro(maestro_id_ind).get(elegido, [])
+        if bancos_declarados:
+            st.caption("Bancos declarados en el Maestro: " + ", ".join(bancos_declarados))
+        if cliente_data["cuit"]:
+            st.caption(f"CUIT: {cliente_data['cuit']}")
+
+        forzar_ind = st.checkbox("Reprocesar aunque ya esté hecho", value=False, key="ind_forzar")
+
+        if not cliente_data["link_carpeta"]:
+            st.warning("Este cliente no tiene LINK CARPETA cargado en el Maestro todavía.")
+        elif st.button("▶️ Procesar este cliente", key="ind_run"):
+            rep = O.procesar_cliente(elegido, cliente_data["link_carpeta"],
+                                      int(anio_ind), int(mes_ind), forzar=forzar_ind)
+            _mostrar_reporte(rep)
