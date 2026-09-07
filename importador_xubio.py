@@ -83,6 +83,8 @@ CIRCUITO_POR_CUENTA = {
     'Ingresos brutos a pagar':                  IMP,
     'Intereses fiscales':                       IMP,
     'Impuesto a las Ganancias':                 IMP,
+    'Plan Moratoria Ley 27563':                 IMP,
+    'Plan Moratoria Ley 27562':                 IMP,
 
     'SUELDOS A PAGAR':                          SUE,
     'Sueldos a pagar':                          SUE,
