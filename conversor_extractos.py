@@ -78,10 +78,12 @@ class Resultado:
 # ---------------------------------------------------------------------------
 def num_ar(txt: str) -> float:
     """Convierte número en formato argentino a float.
-       '1.234.567,89' -> 1234567.89 ; signo negativo puede ir al final ('...,72-')."""
-    txt = txt.strip()
+       '1.234.567,89' -> 1234567.89 ; signo negativo puede ir al final ('...,72-').
+       Tolera un '$' adelante y espacios de más (formato de Google Sheets,
+       ej. '$ 1.234,56')."""
+    txt = str(txt).strip().replace('$', '').strip()
     neg = txt.endswith('-')
-    txt = txt.rstrip('-')
+    txt = txt.rstrip('-').strip()
     return (-1 if neg else 1) * float(txt.replace('.', '').replace(',', '.'))
 
 RE_NUM = re.compile(r'^-?[\d.]+,\d{2}-?$')
@@ -629,58 +631,65 @@ def leer_macro(pdf) -> List[Resultado]:
 #   3) Si varios proveedores comparten importe: se desempata por nombre en el texto.
 # Si no se identifica, queda "a imputar" para revisión humana (NUNCA se adivina).
 # ===========================================================================
-def cargar_proveedores(path: str) -> dict:
-    """Lee el Excel de proveedores del cliente. Devuelve índices para imputar:
-       por_cuit {cuit11 -> nombre}, por_importe {importe -> {nombres}}."""
-    import openpyxl
-    wb = openpyxl.load_workbook(path, data_only=True)
+def cargar_proveedores(solapas: dict) -> dict:
+    """`solapas` = {nombre_de_solapa: [filas...]} del archivo 'Listado y Ca
+    Cte de Proveedores' del cliente (las filas ya vienen leídas, ej. con
+    drive_io.leer_sheet — esta función no sabe de dónde salieron).
+    No importa cómo se llamen las solapas: se identifican por sus columnas,
+    igual que antes cuando se leía el Excel.
+    Devuelve índices para imputar: por_cuit {cuit11 -> nombre},
+    por_importe {importe -> {nombres}}."""
     por_cuit = {}; nombres = set(); por_importe = {}
-    for name in wb.sheetnames:
-        ws = wb[name]
-        H = {str(ws.cell(1, c).value or '').strip().lower(): c
-             for c in range(1, ws.max_column + 1)}
+    for filas in solapas.values():
+        if not filas:
+            continue
+        cols = {_norm_concepto(k) for k in filas[0].keys()}
         # Hoja directorio: Nombre + Número de Identificación (CUIT)
-        col_id = H.get('número de identificación') or H.get('numero de identificacion')
-        if 'nombre' in H and col_id:
-            for r in range(2, ws.max_row + 1):
-                nom = ws.cell(r, H['nombre']).value; cid = ws.cell(r, col_id).value
+        if _norm_concepto('Nombre') in cols and _norm_concepto('Número de Identificación') in cols:
+            for fila in filas:
+                nom = _valor(fila, 'Nombre'); cid = _valor(fila, 'Número de Identificación')
                 if nom and cid:
                     cu = re.sub(r'\D', '', str(cid))
                     if len(cu) == 11: por_cuit[cu] = str(nom).strip()
                     nombres.add(str(nom).strip().upper())
-        # Hoja cuenta corriente: importes de Facturas de Compra por proveedor
-        if 'proveedor' in H and 'haber' in H and 'documento' in H:
-            for r in range(2, ws.max_row + 1):
-                doc = str(ws.cell(r, H['documento']).value or '')
-                prov = ws.cell(r, H['proveedor']).value
-                hab = ws.cell(r, H['haber']).value
-                if prov and hab and 'factura' in doc.lower():
-                    por_importe.setdefault(round(float(hab), 2), set()).add(str(prov).strip().upper())
+        # Hoja cuenta corriente: importes de Facturas de Compra por proveedor.
+        # Filtro EXACTO que pide el plan: solo filas con debehaber = -1
+        # ("Factura de Compra"), nunca los pagos.
+        elif {_norm_concepto('Proveedor'), _norm_concepto('Haber'), _norm_concepto('debehaber')} <= cols:
+            for fila in filas:
+                prov = _valor(fila, 'Proveedor'); hab = _valor(fila, 'Haber')
+                dh = _valor(fila, 'debehaber')
+                try:
+                    es_factura_compra = int(float(dh)) == -1
+                except (TypeError, ValueError):
+                    es_factura_compra = False
+                if prov and hab and es_factura_compra:
+                    try:
+                        importe = round(float(hab), 2)
+                    except (TypeError, ValueError):
+                        continue
+                    por_importe.setdefault(importe, set()).add(str(prov).strip().upper())
     return dict(por_cuit=por_cuit, por_importe=por_importe, nombres=nombres)
 
-def imputar_proveedores(res: Resultado, prov: dict, cuenta: str = 'Proveedores') -> Resultado:
-    """Identifica el proveedor de cada débito marcado 'PROVEEDOR (a imputar)'."""
-    for m in res.movimientos:
-        if m.cuenta_sugerida: continue
-        if not (m.categoria or '').startswith('PROVEEDOR'): continue
-        matched = None
-        cu = re.sub(r'\D', '', m.cuit or '')
-        if len(cu) == 11 and cu in prov['por_cuit']:
-            matched = prov['por_cuit'][cu]                      # 1) por CUIT
-        else:
-            cand = prov['por_importe'].get(round(m.debito, 2))
-            if cand and len(cand) == 1:
-                matched = next(iter(cand))                      # 2) por importe exacto
-            elif cand and len(cand) > 1:                        # 3) desempate por nombre
-                txt = _texto_mov(m).upper()
-                hits = [n for n in cand if n in txt]
-                if len(hits) == 1: matched = hits[0]
-        # El contador manda TODOS los pagos a proveedores a la cuenta 'Proveedores'.
-        # El CUIT solo sirve para identificar cuál proveedor (detalle), no la cuenta.
-        m.categoria = 'PROVEEDOR' if matched else 'PROVEEDOR (sin identificar)'
-        m.cuenta_sugerida = cuenta
-        if matched and not m.nombre: m.nombre = matched
-    return res
+def cargar_empleados_socios(solapas: dict) -> dict:
+    """`solapas` = {nombre_de_solapa: [filas...]} del mismo archivo de
+    Proveedores (la solapa EMPLEADOS Y SOCIOS vive ahí). Devuelve
+    {cuit11 -> cuenta contable}. Reemplaza a los diccionarios hardcodeados
+    SOCIOS_CUIT / SUELDOS_CUIT: la cuenta (Cuenta Particular del socio,
+    Sueldos a Pagar, etc.) sale directo de la columna CUENTA CONTABLE que
+    carga el cliente — no hay ninguna distinción hardcodeada por persona."""
+    out = {}
+    for filas in solapas.values():
+        if not filas:
+            continue
+        cols = {_norm_concepto(k) for k in filas[0].keys()}
+        if _norm_concepto('CUIT') in cols and _norm_concepto('CUENTA CONTABLE') in cols:
+            for fila in filas:
+                cid = _valor(fila, 'CUIT'); cta = _valor(fila, 'CUENTA CONTABLE')
+                if cid and cta:
+                    cu = re.sub(r'\D', '', str(cid))
+                    if len(cu) == 11: out[cu] = str(cta).strip()
+    return out
 
 # ===========================================================================
 # IMPUTACIÓN DE VEP / IMPUESTOS AFIP  (por importe -> concepto -> cuenta)
@@ -689,64 +698,74 @@ def imputar_proveedores(res: Resultado, prov: dict, cuenta: str = 'Proveedores')
 # Importe + Descripcion, ej. 'IVA DJ01/26', 'SIJPDJ02/26', 'IIBBBA02/26').
 # Si el mismo importe está en varios VEP, se desempata por fecha más cercana.
 # ===========================================================================
-def cargar_vep(path: str, hoja: str = 'VEP') -> dict:
-    import openpyxl
-    wb = openpyxl.load_workbook(path, data_only=True)
-    if hoja not in wb.sheetnames:
-        return dict(por_importe={})
-    ws = wb[hoja]
-    H = {str(ws.cell(1, c).value or '').strip().lower(): c for c in range(1, ws.max_column + 1)}
-    cI = H.get('importe'); cD = H.get('descripcion') or H.get('descripción'); cF = H.get('fecha de pago')
-    por_importe = {}
-    if not cI:
-        return dict(por_importe={})
-    for r in range(2, ws.max_row + 1):
-        imp = ws.cell(r, cI).value
-        if imp is None: continue
-        try: imp = round(float(imp), 2)
-        except (TypeError, ValueError): continue
-        desc = str(ws.cell(r, cD).value or '').strip() if cD else ''
-        fec = ws.cell(r, cF).value if cF else None
-        por_importe.setdefault(imp, []).append((desc, fec))
-    return dict(por_importe=por_importe)
+def _parse_fecha_vep(txt):
+    """'Fecha de Pago' de la solapa VEP viene en DOS formatos mezclados
+       ('13/11/2024 17:16' y '2026-06-11 19:49:39' — Google Sheets los
+       formatea distinto según cómo se cargó la fila). Sin match -> None
+       (esa fila deja de poder desempatar por fecha, pero si es la única
+       con ese importe igual se usa)."""
+    if not txt:
+        return None
+    txt = str(txt).strip()
+    m = re.match(r'(\d{2})/(\d{2})/(\d{4})', txt)
+    if m:
+        d, mo, y = m.groups()
+    else:
+        m = re.match(r'(\d{4})-(\d{2})-(\d{2})', txt)
+        if not m:
+            return None
+        y, mo, d = m.groups()
+    try:
+        return datetime.date(int(y), int(mo), int(d))
+    except ValueError:
+        return None
 
-def _cuenta_impuesto(desc: str):
-    d = (desc or '').upper()
-    if 'IVA' in d:                                                 return ('IMPUESTO IVA', 'IVA a pagar')
-    if 'SIJP' in d or 'SUSS' in d or 'SEG SOCIAL' in d:            return ('CARGAS SOCIALES', 'CARGAS SOCIALES A PAGAR')
-    if any(k in d for k in ('IIBB', 'IBBA', 'BRUTOS', 'SIRCREB')): return ('INGRESOS BRUTOS', 'Ingresos brutos a pagar')
-    if 'GANANCIA' in d:                                            return ('GANANCIAS', 'Impuesto a las Ganancias')
-    if 'INTERES' in d or 'RESARC' in d:                            return ('INTERESES AFIP', 'Impuestos y Tasas')
-    return ('IMPUESTO AFIP', 'Impuestos y Tasas')
+def cargar_vep(solapas: dict) -> dict:
+    """`solapas` = {nombre_de_solapa: [filas...]} del archivo 'Vep Pagados'
+    del cliente. Devuelve:
+      por_importe : {importe -> [(descripcion, fecha_o_None), ...]}
+                    (solo las filas con Estado = 'Pagado')
+      conceptos   : [(raiz_normalizada, cuenta), ...] de la solapa
+                    CONCEPTOS VEP, ordenada por raíz más larga primero
+                    (para que una raíz más específica gane antes que una
+                    más corta que también matchea)."""
+    por_importe = {}; conceptos = []
+    for filas in solapas.values():
+        if not filas:
+            continue
+        cols = {_norm_concepto(k) for k in filas[0].keys()}
+        if _norm_concepto('Importe') in cols and (_norm_concepto('Descripcion') in cols or _norm_concepto('Descripción') in cols):
+            for fila in filas:
+                estado = _valor(fila, 'Estado')
+                if estado and _norm_concepto(estado) != _norm_concepto('Pagado'):
+                    continue  # solo VEP efectivamente pagados
+                imp = _valor(fila, 'Importe')
+                if imp is None:
+                    continue
+                try:
+                    imp = round(num_ar(str(imp)), 2)
+                except (TypeError, ValueError):
+                    continue
+                desc = str(_valor(fila, 'Descripcion', 'Descripción') or '').strip()
+                fec = _parse_fecha_vep(_valor(fila, 'Fecha de Pago'))
+                por_importe.setdefault(imp, []).append((desc, fec))
+        elif _norm_concepto('CONCEPTO VEP') in cols and _norm_concepto('CUENTA CONTABLE') in cols:
+            for fila in filas:
+                raiz = _valor(fila, 'CONCEPTO VEP'); cta = _valor(fila, 'CUENTA CONTABLE')
+                if raiz and cta:  # celda vacía (ej. ARCA, MULTA, ART sin definir) -> no se carga, queda pendiente
+                    conceptos.append((_norm_concepto(raiz), str(cta).strip()))
+    conceptos.sort(key=lambda t: -len(t[0]))
+    return dict(por_importe=por_importe, conceptos=conceptos)
 
-def imputar_vep(res: Resultado, vep: dict, tol_dias: int = 45, cuenta_afip: str = None) -> Resultado:
-    """Identifica el impuesto de cada pago de AFIP marcado 'IMPUESTOS AFIP/VEP'.
-       Si se pasa cuenta_afip (ej. 'AFIP-RENTAS'), TODOS los pagos de AFIP van a esa
-       cuenta puente (como hace el contador en la conciliación), y el impuesto puntual
-       (SIJPDJ05/26, etc.) queda como detalle en 'nombre'. Si no, se separa por impuesto."""
-    import datetime
-    def _dif(item, fmov):
-        f = item[1]
-        if isinstance(f, datetime.datetime): f = f.date()
-        if isinstance(f, datetime.date) and fmov: return abs((f - fmov).days)
-        return 10 ** 6
-    for m in res.movimientos:
-        if m.cuenta_sugerida: continue
-        if not (m.categoria or '').startswith('IMPUESTOS AFIP'): continue
-        cand = vep['por_importe'].get(round(m.debito, 2))
-        if not cand: continue
-        if len(cand) == 1:
-            elegido = cand[0]
-        else:
-            mejor = min(cand, key=lambda it: _dif(it, m.fecha))
-            elegido = mejor if _dif(mejor, m.fecha) <= tol_dias else None
-        if elegido:
-            if cuenta_afip:
-                m.categoria = 'IMPUESTO AFIP'; m.cuenta_sugerida = cuenta_afip
-            else:
-                m.categoria, m.cuenta_sugerida = _cuenta_impuesto(elegido[0])
-            m.nombre = elegido[0]        # concepto VEP puntual (ej. SIJPDJ05/26)
-    return res
+def _cuenta_por_concepto_vep(desc: str, conceptos: list):
+    """Busca en `conceptos` (de cargar_vep) la primera raíz con la que el
+       concepto puntual del VEP (ej. 'SIJPDJ05/26') EMPIEZA. Sin match ->
+       None (pendiente; nunca se adivina)."""
+    d = _norm_concepto(desc)
+    for raiz, cta in conceptos:
+        if raiz and d.startswith(raiz):
+            return cta
+    return None
 
 # Firmas por texto EN MAYÚSCULAS. Ojo: el extracto de Galicia puede contener la
 # palabra "BBVA" (en un detalle de transferencia), y en el PDF de BBVA el nombre
@@ -796,273 +815,194 @@ def verificar_control(res: Resultado):
                 saldos_parciales_mal=parciales)
 
 # ===========================================================================
-# CLASIFICACIÓN CONTABLE (primer ladrillo: SUELDOS)
-# ---------------------------------------------------------------------------
-# Reglas de TEXTO (sin IA, auditables). Cada banco escribe distinto el pago de
-# haberes, pero todos usan las palabras HABERES o SUELDO. Se detecta por esa
-# palabra ancla (no por la frase exacta) para que aguante cambios de redacción
-# del banco -> ej.: BBVA pasó de "DB/CR POR PAGO DE SUELDOS" a "DEBITO POR PAGO
-# DE HABERES OL". Relevamiento por banco:
-#   Galicia : "SERVICIO ACREDITAMIENTO DE HABERES" / "ACRED.HABERES"
-#   Comafi  : "Transf inmed sueldos e-Banking"
-#   BBVA    : "DEBITO POR PAGO DE HABERES OL" / "DB/CR POR PAGO DE SUELDOS"
-#             (además origen "D 569" como señal de respaldo)
-# La cuenta contable exacta depende del plan de cuentas del cliente: se pasa por
-# parámetro. Por defecto, etiqueta genérica a confirmar contra el plan.
+# CLASIFICACIÓN CONTABLE — TODO sale de los 4 archivos del cliente (Fase 2).
+# Cero reglas de negocio en el código: si algo no se puede resolver con los
+# datos del cliente, el movimiento queda "a imputar" para revisión humana.
 # ===========================================================================
-CUENTA_SUELDOS_DEFAULT = 'Sueldos a pagar'
-
-# Diccionario del contador (criterios de imputación aprendidos de un cliente real).
-# Es la fuente de verdad por defecto; se puede pasar otro 'mapeo' para casos especiales.
-MAPEO_CONTADOR = {
-    'ACREDITACION MASTERCARD': 'Deudores por Venta',
-    'ACREDITACION VISA': 'Deudores por Venta',
-    'ANULACION DEBITOS': 'Proveedores',
-    'ANULACION I LEY 25.413': 'Impuesto al Débito Ley 25.413',
-    'ANULACION IMP LEY 25413 DEB 0,6%': 'Impuesto al Débito Ley 25.413',
-    'ANULACION VISA': 'Proveedores',
-    'CASHBACK BIENVENIDA PYME GALICIA': 'Impuestos y Tasas',
-    'CHEQUE 48 HORAS': 'Proveedores',
-    'CHEQUE DE CAJA': 'Caja',
-    'CHEQUE PAGADOR POR CAJA': 'Proveedores',
-    'CHEQUE RECHAZADO': 'Caja',
-    'COM CHEQUE RECHAZADO': 'Gastos bancarios',
-    'COM CONS CHEQ S/ SALDO': 'Gastos bancarios',
-    'COM CONS CHEQ S\\ SALDO': 'Gastos bancarios',
-    'COM MOVIMIENTOS OTRA SUCURSAL': 'Gastos bancarios',
-    'COM VALOR AL COBRO': 'Gastos bancarios',
-    'COM.GESTION COBRO CH': 'Gastos bancarios',
-    'COM.IMP/SERBEPE': 'Gastos bancarios',
-    'COM.POR EXTRACCIONES': 'Gastos bancarios',
-    'COM.TRANSF.INTERNET': 'Gastos bancarios',
-    'COMISION EXCESO MOVS EXTRACCIONES': 'Gastos bancarios',
-    'COMISION MANT,CTA': 'Gastos bancarios',
-    'COMISION MANT.CTA': 'Gastos bancarios',
-    'COMISION MOV CLEARING': 'Gastos bancarios',
-    'COMISION POR CHEQUERA': 'Gastos bancarios',
-    'COMISION POR SERVICIO DE CUENTA': 'Gastos bancarios',
-    'COMISION SERVICIO DE CUENTA': 'Gastos bancarios',
-    'CR COMER': 'Proveedores',
-    'CRED.ACOMERCIOS TARJ.CRED VISA': 'Proveedores',
-    'CREDITO TRANSFERENCIA': 'Deudores por Venta',
-    'CREDITO TRANSFERENCIA COELSA': 'Deudores por Venta',
-    'DB.COMERCIO': 'Proveedores',
-    'DEB.COMERCIO TC': 'Proveedores',
-    'DEBITO POR COMPRA VENTA DOLARES - USD': 'Moneda Extranjera',
-    'DEBITO TRANSF. ONLINE BANKING EMP - A CTA 0217-007003612853 ARS': 'Proveedores',
-    'DEP CH 24 HS AUTOSERV': 'Caja',
-    'DEP. CANJE INTERNO': 'Caja',
-    'DEP.CHEQUES AUTO': 'Caja',
-    'DEP.CHEQUES AUTOSERV': 'Caja',
-    'DEPOSITO CHEQUES': 'Caja',
-    'DEPOSITO EFVO CAJ AUT': 'Caja',
-    'DEPOSITO INTERSUCURSAL (CAJA)': 'Caja',
-    'DEV.IMP.DEB.LEY 25413-ALIC.GENERAL': 'Impuesto al Débito Ley 25.413',
-    'DGI/AFIP': 'AFIP-RENTAS',
-    'FCI SUSCRIPCION': 'FCI',
-    'HONORARIOS DE PROFESIONALES': 'Deudores por Venta',
-    'I,V,A,': 'IVA Crédito Fiscal',
-    'I.V.A': 'IVA Crédito Fiscal',
-    'I.V.A. REDUCIDO 50%': 'IVA Crédito Fiscal',
-    'IB. MULTIL.CABA': 'Retenciones Ingresos Brutos CABA',
-    'IBCABA PERCEP': 'Percepción Ingresos Brutos Sufrida',
-    'IMP LEY 25413 CRED 0,6%': 'Impuesto al Crédito Ley 25.413',
-    'IMP SELLOS CABA AD. EN CTA.CTE': 'Gastos bancarios',
-    'IMP. CRE. LEY 25413': 'Impuesto al Crédito Ley 25.413',
-    'IMP. DEB. LEY 25413 GRAL': 'Impuesto al Débito Ley 25.413',
-    'IMP. ING. BRUTOS': 'Percepción Ingresos Brutos Sufrida',
-    'IMPUESTO DE SELLOS': 'Impuestos y Tasas',
-    'ING. BRUTOS S/ CRED': 'Percepción Ingresos Brutos Sufrida',
-    'INGRESOS BRUTOS': 'Impuestos y Tasas',
-    'INTERES SALDO DEUDOR': 'Gastos bancarios',
-    'INTERESES POR DESCUBIERTO': 'Gastos bancarios',
-    'INTERESES SOBRE SALDOS DEUDORES': 'Gastos bancarios',
-    'IVA': 'IVA Crédito Fiscal',
-    'IVA - REDUCIDO 10,5%': 'IVA Crédito Fiscal',
-    'IVA PERCEPCION': 'Percepción de IVA Sufrida',
-    'IVA TASA GENERAL': 'IVA Crédito Fiscal',
-    'MANTENIMIENTO': 'Gastos bancarios',
-    'MUNI CIUDAD BA': 'Impuestos y Tasas',
-    'NAVE - VENTA CON TARJETA': 'Deudores por Venta',
-    'NAVE PAGO CON TRANSFERENCIA': 'Deudores por Venta',
-    'PAGO A COMERCIOS': 'Deudores por Venta',
-    'PAGO A COMERCIOS VISA': 'Deudores por Venta',
-    'PAGO A PROVEEDORES - 180728078MERCADOLIBRE SRL': 'Deudores por Venta',
-    'PAGO CCI 24HS GRAVADA INTERBANKING - A CBU 0070105720000005696688': 'Proveedores',
-    'PAGO CHEQ.DE MOSTRADOR(CAJA)': 'Proveedores',
-    'PAGO DE CH.INTERSUCURSAL(CAJA)': 'Proveedores',
-    'PAGO PROVEEDORES DATANET': 'Proveedores',
-    'PCT PAGO CON TRANSF': 'Deudores por Venta',
-    'PERC.INGRESOS BRUTOS': 'Percepción Ingresos Brutos Sufrida',
-    'PERCEP. IVA': 'Percepción de IVA Sufrida',
-    'RECAUDACIONES ELECTRONICAS TARJ': 'Proveedores',
-    'REG.REC.SIRCREB': 'Sircreb',
-    'RESUMEN DE CUENTA': 'Gastos bancarios',
-    'RETIRO EN EFVO POR CAJA SUC 0395': 'Caja',
-    'SELLADO': 'Gastos bancarios',
-    'SERV. AGUA/ GAS': 'Agua',
-    'SERVIC ELECTRIC': 'Energía Eléctrica',
-    'SERVIC TELEFONI': 'Telefonia',
-    'SERVIC/IMPUESTO': 'AFIP-RENTAS',
-    'SERVICIO ACREDITAMIENTO DE HABERES': 'SUELDOS A PAGAR',
-    'SERVICIO PAGO A PROVEEDORES': 'Deudores por Venta',
-    'SERVICIO TERMINAL PAYWAY': 'Proveedores',
-    'SNP PAGO A PROVEEDORES': 'Deudores por Venta',
-    'SUELDOS': 'Deudores por Venta',
-    'SUELDOS TRANSFERIDOS': 'SUELDOS A PAGAR',
-    'SUSCRIPCION FIMA': 'FCI',
-    'TARJ,CRED,(AJUSTE COM)': 'Gastos bancarios',
-    'TARJ.CRED.(AJUSTE COM)': 'Gastos bancarios',
-    'TRANSF. AFIP': 'EATON DIEGO MARTIN - Cuenta Particular',
-    'TRANSF. CTAS PROPIAS': 'Banco Galicia en $',
-    'TRANSF.DATANET': 'Deudores por Venta',
-    'TRANSF.ELECTRON': 'Deudores por Venta',
-    'TRANSF.FONDOS': 'Proveedores',
-    'TRANSFER. CASH MISMA TITULARIDAD': 'Banco Galicia en $',
-    'TRANSFERENCIA': 'Proveedores',
-    'TRANSFERENCIA DE CUENTA PROPIA': 'Banco Galicia en $',
-    'TRANSFERENCIA DE TERCEROS': 'Deudores por Venta',
-    'TRANSFERENCIAS': 'Deudores por Venta',
-    'TRANSFERENCIAS CASH PROVEEDORES': 'Deudores por Venta',
-    'TRASPASO DE SALDO G+': 'Banco',
-    'TRF ORDEN JUDIC': 'Proveedores',
-}
-
-
-# Reglas de clasificación por TEXTO del concepto. El orden es la prioridad: gana
-# la primera que coincide. La 'cuenta' es una ETIQUETA por defecto y hay que
-# confirmarla contra el plan de cuentas de cada cliente. cuenta '' = todavía no
-# se puede resolver solo: requiere el paso siguiente (VEP por importe, o
-# proveedor por CUIT->importe->nombre) -> queda marcado "a imputar".
-# (categoria, cuenta_sugerida, patrón, aplica)  aplica: 'debito' | 'credito' | 'ambos'
-REGLAS_CONCEPTO = [
-    # --- Servicios/proveedores identificados por NOMBRE (confirmados contra asientos del contador) ---
-    # Vienen con concepto genérico "PAGO DE SERVICIOS" o "DEB. AUTOM. DE SERV.", así que se
-    # reconocen por el nombre del prestador. Van arriba para ganar antes que reglas genéricas.
-    ('SERVICIO EDESUR',      'Energía Eléctrica',              r'EDESUR',                                        'debito'),
-    ('SERVICIO AYSA',        'Agua',                           r'\bAYSA\b',                                      'debito'),
-    ('SERVICIO VERISURE',    'Proveedores',                    r'VERISURE',                                      'debito'),
-    # --- Servicios identificados por NOMBRE (cuenta indicada por Martín / estudio 20/8/2026) ---
-    ('SERVICIO AGIP/ABL',    'Impuestos y Tasas',              r'AGIP',                                          'debito'),
-    ('SERVICIO INTERFAST',   'Proveedores',                    r'INTERFAST',                                     'debito'),
-    ('SERVICIO SEGUROS',     'Impuestos y Tasas',              r'FED\.?\s*PATRONAL|FEDERACION PATRONAL',         'debito'),
-    # RESCATE/SUSCRIPCIÓN de FCI -> Inversiones (cuenta FCI). El desglose FCI vs
-    # "Resultado por Inversión" lo hace el contador aparte; el sistema pone el total en FCI.
-    ('INVERSIONES FCI',      'FCI',                            r'RESCATE|\bFIMA\b|SUSCRIPCION\s+FCI',            'ambos'),
-    ('SUELDOS',              CUENTA_SUELDOS_DEFAULT,           r'HABERES|SUELDO',                                'debito'),
-    ('IMP. LEY 25413 CRED',  'Impuesto al Crédito Ley 25.413', r'(?:IMP\.?\s*CRE|SOBRE\s*CRED).*25\.?413|25\.?413.*CRE|IMPUESTO A LOS CREDITOS', 'ambos'),
-    ('IMP. LEY 25413 DEB',   'Impuesto al Débito Ley 25.413',  r'25\.?413|DEBITOS Y CREDITOS|IMPUESTO A LOS DEBITOS|TRANSFINAN|TRANSACCIONES FINAN', 'ambos'),
-    ('PERCEPCION IVA',       'Percepción de IVA Sufrida',      r'PERCEP\w*\.?\s*IVA|PERC\.?\s*IVA',               'debito'),
-    ('SIRCREB',              'Sircreb',                        r'SIRCREB',                                       'debito'),
-    ('PERCEPCION IIBB',      'Percepción Ingresos Brutos Sufrida', r'ING\.?\s*BRUT|INGRESOS BRUTOS|IIBB|PERC\w*\.?\s*(?:ING|CABA)|CABA\s*ING', 'debito'),
-    ('IMPUESTO SELLOS',      'Impuestos y Tasas',              r'SELLOS|SELLADO',                                'debito'),
-    ('TRANSF. CTAS PROPIAS', 'Transferencias entre cuentas',   r'CCP\d|CAP\d|CTAS?\s*PROP|MISMA TITULARIDAD|CUENTAS? PROPIAS?|CUENTA PROPIA', 'ambos'),
-    ('COMISIONES',           'Gastos bancarios',               r'COMISION|COMI\b|COM\s*MANT|MANTENIMIENTO|SERVICIO DE CUENTA|COMIS\b', 'debito'),
-    ('IVA',                  'IVA Crédito Fiscal',             r'\bIVA\b',                                       'debito'),
-    ('INTERESES',            'Gastos bancarios',               r'INTERES',                                       'debito'),
-    ('IMPUESTOS AFIP/VEP',   '',                               r'IMP\.?\s*AFIP|PAGOS?\s*AFIP|SERVICIOS IMP',     'debito'),
-    ('PROVEEDOR',            'Proveedores',                    r'PROVEEDOR|TRF\s*INMED|TRANSFER|TRANSF',         'debito'),
-    ('COBRANZA',             None,                             r'.',                                             'credito'),
-]
-_REGLAS = [(cat, cta, re.compile(pat, re.IGNORECASE), ap) for cat, cta, pat, ap in REGLAS_CONCEPTO]
-
 import unicodedata as _ud
 def _sin_acentos(s: str) -> str:
     return ''.join(c for c in _ud.normalize('NFD', str(s)) if _ud.category(c) != 'Mn')
-
-def _txt_regla(m) -> str:
-    """Texto del movimiento normalizado para las reglas: sin acentos ni puntos, MAYÚSCULAS.
-       Así 'I.V.A.' -> 'IVA' y 'Débitos y Créditos' -> 'DEBITOS Y CREDITOS'."""
-    return _sin_acentos(f"{m.concepto} {m.nombre} {m.referencia}").upper().replace('.', '')
 
 def _texto_mov(m: Movimiento) -> str:
     # En Galicia el nombre/detalle (p.ej. 'HABERES') va en 'nombre'; se incluye.
     return f"{m.concepto} {m.nombre} {m.referencia}"
 
 def _norm_concepto(s: str) -> str:
-    """Normaliza un concepto para cruzar extracto vs tabla del cliente."""
-    s = re.sub(r'\s+', ' ', str(s or '').upper().strip())
+    """Normaliza texto para comparar TOLERANDO mayúsculas, acentos y espacios
+       de más (Regla de oro #4). Se usa para conceptos, cuentas, nombres de
+       prestador/proveedor y nombres de columna de los Sheets — cualquier
+       texto que carguen personas y pueda tener variaciones de tipeo."""
+    s = _sin_acentos(str(s or '')).upper()
+    s = re.sub(r'\s+', ' ', s).strip()
     return s.rstrip(' .')
 
-def cargar_mapeo_conceptos(path: str, hoja: str = 'Concepto gasto y asignacion cta') -> dict:
-    """Lee la tabla concepto->cuenta del liquidador del cliente (fuente de verdad).
-       Solo usa conceptos con cuenta ÚNICA; los ambiguos (varias cuentas posibles)
-       NO se auto-asignan (requieren CUIT/importe/humano)."""
-    import openpyxl
-    wb = openpyxl.load_workbook(path, data_only=True)
-    if hoja not in wb.sheetnames:
-        return dict(mapeo={}, ambiguos=set())
-    ws = wb[hoja]
-    H = {str(ws.cell(1, c).value or '').strip().upper(): c for c in range(1, ws.max_column + 1)}
-    cB = H.get('CONCEPTO EXTRACTO'); cC = H.get('CUENTA CONTABLE')
-    if not cB or not cC:
-        return dict(mapeo={}, ambiguos=set())
-    tmp = {}
-    for r in range(2, ws.max_row + 1):
-        con = ws.cell(r, cB).value; cta = ws.cell(r, cC).value
-        if con and cta:
-            tmp.setdefault(_norm_concepto(con), set()).add(str(cta).strip())
+def _valor(fila: dict, *nombres_col):
+    """Valor de una fila (dict, como las que devuelve drive_io.leer_sheet)
+       por nombre de columna, tolerante a mayúsculas/acentos/espacios en el
+       encabezado. Prueba cada nombre en `nombres_col` en orden."""
+    idx = {_norm_concepto(k): v for k, v in fila.items()}
+    for n in nombres_col:
+        v = idx.get(_norm_concepto(n))
+        if v not in (None, ''):
+            return v
+    return None
+
+def cargar_conceptos(solapas: dict) -> dict:
+    """`solapas` = {nombre_de_solapa: [filas...]} del archivo 'CONCEPTO
+    GASTO Y ASIGNACION CUENTA' del cliente. No importa cómo se llamen las
+    solapas: se identifican por sus columnas.
+    Devuelve:
+      mapeo     : {concepto normalizado -> cuenta}   (solapa principal, cuenta ÚNICA)
+      ambiguos  : {concepto normalizado, ...}         (solapa principal, varias cuentas -> "por jerarquía")
+      servicios : {prestador normalizado -> cuenta}   (solapa SERVICIOS)
+    Concepto con celda de cuenta vacía, o ambiguo, NO se auto-asigna acá
+    (requiere el paso siguiente en clasificar(): contraparte / VEP / humano)."""
+    tmp, servicios = {}, {}
+    for filas in solapas.values():
+        if not filas:
+            continue
+        cols = {_norm_concepto(k) for k in filas[0].keys()}
+        if _norm_concepto('CONCEPTO EXTRACTO') in cols and _norm_concepto('CUENTA CONTABLE') in cols:
+            for fila in filas:
+                con = _valor(fila, 'CONCEPTO EXTRACTO'); cta = _valor(fila, 'CUENTA CONTABLE')
+                if con and cta:
+                    tmp.setdefault(_norm_concepto(con), set()).add(str(cta).strip())
+        elif _norm_concepto('PRESTADOR') in cols and _norm_concepto('CUENTA CONTABLE') in cols:
+            for fila in filas:
+                prest = _valor(fila, 'PRESTADOR'); cta = _valor(fila, 'CUENTA CONTABLE')
+                if prest and cta:
+                    servicios[_norm_concepto(prest)] = str(cta).strip()
     mapeo = {k: next(iter(v)) for k, v in tmp.items() if len(v) == 1}
     ambiguos = {k for k, v in tmp.items() if len(v) > 1}
-    return dict(mapeo=mapeo, ambiguos=ambiguos)
+    return dict(mapeo=mapeo, ambiguos=ambiguos, servicios=servicios)
 
-def es_sueldo(mov: Movimiento) -> bool:
-    """True si el movimiento es un pago de sueldos/haberes."""
-    return bool(re.search(r'HABERES|SUELDO', _texto_mov(mov), re.IGNORECASE)) and mov.debito > 0
+def cargar_plan_cuentas(solapas: dict) -> set:
+    """`solapas` = {nombre_de_solapa: [filas...]} del archivo PLAN DE
+    CUENTAS del cliente. Devuelve el conjunto de nombres de cuenta válidos
+    (normalizados) para el control cruzado de clasificar()."""
+    cuentas = set()
+    for filas in solapas.values():
+        if not filas:
+            continue
+        cols = {_norm_concepto(k) for k in filas[0].keys()}
+        if _norm_concepto('Nombre') in cols:
+            for fila in filas:
+                nom = _valor(fila, 'Nombre')
+                if nom:
+                    cuentas.add(_norm_concepto(nom))
+    return cuentas
 
-# Socios cuyos retiros (pagos que les hace la empresa) van a su Cuenta Particular.
-# Se identifican por CUIT (único), no por nombre (que puede venir escrito distinto).
-SOCIOS_CUIT = {
-    '23162662449': 'EATON DIEGO MARTIN - Cuenta Particular',
-    '20117996183': 'SANCHEZ EDUARDO OMAR - Cuenta Particular',
-}
+def clasificar(res: Resultado, conceptos: dict, empleados_socios: dict,
+               proveedores: dict, vep: dict, plan_cuentas: set = None,
+               tol_dias_vep: int = 45) -> Resultado:
+    """Asigna cuenta contable a cada movimiento leyendo TODO de los 4
+    archivos del cliente (nada hardcodeado). Por cada movimiento, en orden:
+      1) Concepto EXACTO en la tabla de conceptos del cliente, si tiene una
+         sola cuenta posible (comparación tolerante).
+      2) Si no (no está, o está "por jerarquía" con varias cuentas) ->
+         se busca la contraparte, en este orden:
+           a) Empleados y Socios, por CUIT (solo débitos).
+           b) Proveedores: CUIT -> razón social -> importe exacto de
+              factura de compra (2+ importes iguales sin desempatar por
+              nombre -> sigue sin resolver, NO se adivina).
+           c) Servicios: nombre del prestador (EDESUR, AYSA, ...) dentro
+              del detalle del movimiento.
+      3) Si sigue sin cuenta -> se prueba como pago de VEP/AFIP: importe
+         exacto contra el listado de VEP pagados del cliente (desempate por
+         fecha de pago más cercana si hay varios), y de ahí la cuenta por
+         la solapa CONCEPTOS VEP (la Descripcion del VEP "empieza con" la
+         raíz cargada, ej. 'SIJPDJ05/26' empieza con 'SIJP').
+      4) Si nada de esto resolvió -> se etiqueta 'PENDIENTE DE IMPUTAR'
+         (sin cuenta) para revisión humana. Nunca se adivina.
+    Control cruzado: si se pasa `plan_cuentas` (de cargar_plan_cuentas) y la
+    cuenta resuelta no figura ahí, el movimiento se manda igual a pendiente
+    y se avisa por print (atrapa cuentas mal cargadas, ej. 'AFIP-RENTAS')."""
+    mapeo = conceptos.get('mapeo', {})
+    servicios = conceptos.get('servicios', {})
+    por_cuit_emp = empleados_socios or {}
+    por_cuit_prov = (proveedores or {}).get('por_cuit', {})
+    por_importe_prov = (proveedores or {}).get('por_importe', {})
+    por_importe_vep = (vep or {}).get('por_importe', {})
+    conceptos_vep = (vep or {}).get('conceptos', [])
 
-# Personas cuyos pagos (débito) el contador imputa a SUELDOS A PAGAR (no a Proveedores).
-# OJO: "honorarios -> sueldos" NO es universal; depende de la persona (Frias/Beeche sí,
-# otros profesionales externos van a Proveedores). Por eso se hace por CUIT, no por concepto.
-# Lista a confirmar/ampliar con el contador.
-SUELDOS_CUIT = {
-    '23215628949': 'SUELDOS A PAGAR',   # Frias Diego Alberto
-    '20401326724': 'SUELDOS A PAGAR',   # Emanuel Nicolas Beeche
-}
+    def _dif_fecha(item, fmov):
+        f = item[1]
+        return abs((f - fmov).days) if (f and fmov) else 10 ** 6
 
-def clasificar(res: Resultado, cuenta_sueldos: str = CUENTA_SUELDOS_DEFAULT, mapeo: dict = None,
-               cuenta_cobranzas: str = 'Deudores por Venta') -> Resultado:
-    """Asigna cuenta contable a cada movimiento.
-       1) Tabla del cliente (fuente de verdad): prueba el concepto, y si no, concepto+nombre
-          (en Galicia el concepto viene partido, ej. 'TRANSFERENCIA DE CUENTA' + 'PROPIA').
-       2) Si no, REGLAS_CONCEPTO (respaldo). Todo crédito no identificado -> cuenta_cobranzas
-          ('Deudores por venta'), como hace el contador en el asiento de COBRANZAS."""
-    tabla = (mapeo.get('mapeo', {}) if mapeo else MAPEO_CONTADOR)  # por defecto, diccionario del contador
     for m in res.movimientos:
-        if m.categoria: continue
-        # Retiros a socios (pago de la empresa al socio) -> su Cuenta Particular. Por CUIT y solo débito.
+        if m.categoria:
+            continue
         cuit_norm = re.sub(r'\D', '', str(m.cuit or ''))
-        if m.debito > 0 and cuit_norm in SOCIOS_CUIT:
-            m.categoria = 'RETIRO'; m.cuenta_sugerida = SOCIOS_CUIT[cuit_norm]
-            continue
-        # Honorarios de personas que el contador trata como sueldos (por CUIT, solo débito).
-        if m.debito > 0 and cuit_norm in SUELDOS_CUIT:
-            m.categoria = 'SUELDOS'; m.cuenta_sugerida = SUELDOS_CUIT[cuit_norm]
-            continue
-        if tabla:
-            for k in (_norm_concepto(m.concepto), _norm_concepto(f"{m.concepto} {m.nombre}")):
-                if k in tabla:
-                    m.categoria = 'MAPEO'; m.cuenta_sugerida = tabla[k]
-                    break
-            if m.categoria: continue
-        txt = _txt_regla(m); es_deb = m.debito > 0; es_cred = m.credito > 0
-        for cat, cta, rx, ap in _REGLAS:
-            if ap == 'debito' and not es_deb: continue
-            if ap == 'credito' and not es_cred: continue
-            if rx.search(txt):
-                if cat == 'SUELDOS':
-                    m.categoria = cat; m.cuenta_sugerida = cuenta_sueldos
-                elif cat == 'COBRANZA':
-                    m.categoria = 'COBRANZA'; m.cuenta_sugerida = cuenta_cobranzas
-                else:
-                    m.categoria = cat; m.cuenta_sugerida = cta
+
+        # 1) Concepto exacto (sin ambigüedad) en la tabla del cliente.
+        for k in (_norm_concepto(m.concepto), _norm_concepto(f"{m.concepto} {m.nombre}")):
+            if k in mapeo:
+                m.categoria = 'CONCEPTO'; m.cuenta_sugerida = mapeo[k]
                 break
+        if m.categoria:
+            continue
+
+        # 2a) Empleados y Socios, por CUIT.
+        if m.debito > 0 and cuit_norm in por_cuit_emp:
+            m.categoria = 'EMPLEADO/SOCIO'; m.cuenta_sugerida = por_cuit_emp[cuit_norm]
+            continue
+
+        # 2b) Proveedores: CUIT -> importe exacto (desempate por nombre en el detalle).
+        matched = None
+        if len(cuit_norm) == 11 and cuit_norm in por_cuit_prov:
+            matched = por_cuit_prov[cuit_norm]
+        elif m.debito > 0:
+            cand = por_importe_prov.get(round(m.debito, 2))
+            if cand and len(cand) == 1:
+                matched = next(iter(cand))
+            elif cand and len(cand) > 1:
+                txt = _texto_mov(m).upper()
+                hits = [n for n in cand if n in txt]
+                if len(hits) == 1:
+                    matched = hits[0]
+        if matched:
+            m.categoria = 'PROVEEDOR'; m.cuenta_sugerida = 'Proveedores'
+            if not m.nombre:
+                m.nombre = matched
+            continue
+
+        # 2c) Servicios: nombre del prestador en el detalle del movimiento.
+        if servicios:
+            txt_detalle = _norm_concepto(_texto_mov(m))
+            for prestador_norm, cta in servicios.items():
+                if prestador_norm and prestador_norm in txt_detalle:
+                    m.categoria = 'SERVICIO'; m.cuenta_sugerida = cta
+                    break
+            if m.categoria:
+                continue
+
+        # 3) VEP: importe exacto -> concepto (solapa CONCEPTOS VEP, "empieza con").
+        if m.debito > 0:
+            cand = por_importe_vep.get(round(m.debito, 2))
+            if cand:
+                if len(cand) == 1:
+                    elegido = cand[0]
+                else:
+                    mejor = min(cand, key=lambda it: _dif_fecha(it, m.fecha))
+                    elegido = mejor if _dif_fecha(mejor, m.fecha) <= tol_dias_vep else None
+                if elegido:
+                    cta = _cuenta_por_concepto_vep(elegido[0], conceptos_vep)
+                    if cta:
+                        m.categoria = 'IMPUESTO AFIP'; m.cuenta_sugerida = cta; m.nombre = elegido[0]
+                        continue
+
+        # 4) Nada resolvió -> pendiente de imputar (etiqueta visual, sin cuenta).
+        m.categoria = 'PENDIENTE DE IMPUTAR'
+
+    # Control cruzado con el Plan de Cuentas del cliente.
+    if plan_cuentas is not None:
+        for m in res.movimientos:
+            if m.cuenta_sugerida and _norm_concepto(m.cuenta_sugerida) not in plan_cuentas:
+                print(f"[clasificar] Aviso: la cuenta '{m.cuenta_sugerida}' (movimiento "
+                      f"'{m.concepto}' del {m.fecha}) no existe en el Plan de Cuentas del "
+                      f"cliente -> se manda a pendientes.")
+                m.categoria = 'PENDIENTE DE IMPUTAR (cuenta no existe en Plan de Cuentas)'
+                m.cuenta_sugerida = ''
     return res
 
 def _sanitizar_hoja(nombre, usados):
@@ -1127,12 +1067,15 @@ def _escribir_hoja(ws, res):
     ws.freeze_panes='A4'
 
 def exportar_excel(resultados, path):
-    """Acepta un Resultado o una lista. Escribe UNA HOJA por cuenta."""
+    """Acepta un Resultado o una lista. Escribe UNA HOJA por cuenta.
+       OJO: ya NO clasifica acá adentro (antes lo hacía con criterios
+       hardcodeados). Clasificar requiere los datos del cliente (Fase 2:
+       cargar_conceptos/cargar_empleados_socios/cargar_proveedores/cargar_vep
+       + clasificar) -- eso lo hace el llamador ANTES de exportar."""
     import openpyxl
     if not isinstance(resultados, list): resultados=[resultados]
     wb=openpyxl.Workbook(); primera=True; usados=set()
     for res in resultados:
-        clasificar(res)                      # rellena cuenta_sugerida (SUELDOS por ahora)
         ws = wb.active if primera else wb.create_sheet(); primera=False
         ws.title=_sanitizar_hoja(res.cuenta, usados)
         _escribir_hoja(ws, res)
@@ -1155,6 +1098,8 @@ if __name__ == '__main__':
         print(f"  · Cta {res.cuenta:22} {len(res.movimientos):3} movs | "
               f"saldo {res.saldo_ini:,.2f} -> {res.saldo_fin:,.2f} | "
               f"control {ctrl['diferencia']:,.2f}  {'OK ✓' if ok else 'REVISAR ✗'}")
+    print("Nota    : este modo de línea de comandos solo lee y controla el PDF -- ya "
+          "no clasifica sin los archivos del cliente (ver Fase 2 / drive_io).")
     import os
     salida = sys.argv[2] if len(sys.argv) > 2 else os.path.basename(entrada).rsplit('.',1)[0] + '_convertido.xlsx'
     exportar_excel(resultados, salida)
