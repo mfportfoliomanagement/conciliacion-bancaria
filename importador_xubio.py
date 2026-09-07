@@ -239,7 +239,10 @@ def construir_asientos(resultados, plan_cuentas: dict):
             clave_mes = (fecha.year, fecha.month)
 
             if not cuenta_int:
-                revisar_global.append((res, m, 'sin cuenta'))
+                # m.categoria ya trae un diagnostico especifico (ver
+                # conversor_extractos.clasificar) -- si por algo viniera
+                # vacio, se avisa igual con un motivo generico.
+                revisar_global.append((res, m, m.categoria or 'sin cuenta'))
                 continue
             circuito = _circuito_de(cuenta_int)
             if circuito is None:

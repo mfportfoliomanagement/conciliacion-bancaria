@@ -992,7 +992,18 @@ def clasificar(res: Resultado, conceptos: dict, empleados_socios: dict,
                         continue
 
         # 4) Nada resolvió -> pendiente de imputar (etiqueta visual, sin cuenta).
-        m.categoria = 'PENDIENTE DE IMPUTAR'
+        #    Mensaje mas especifico segun lo que se sabe del movimiento, para
+        #    orientar a la persona sobre que planilla del cliente completar
+        #    (no es una cuenta -- solo un diagnostico, nunca se adivina).
+        cuit_final = re.sub(r'\D', '', str(m.cuit or ''))
+        if len(cuit_final) == 11:
+            m.categoria = (f"PENDIENTE DE IMPUTAR: CUIT {m.cuit} no está en "
+                            f"Proveedores ni en Empleados y Socios")
+        elif (m.nombre or '').strip():
+            m.categoria = (f"PENDIENTE DE IMPUTAR: '{m.nombre}' no está identificado "
+                            f"como proveedor/prestador en ninguna planilla")
+        else:
+            m.categoria = f"PENDIENTE DE IMPUTAR: concepto '{m.concepto}' no está en la planilla de Conceptos"
 
     # Control cruzado con el Plan de Cuentas del cliente.
     if plan_cuentas is not None:
