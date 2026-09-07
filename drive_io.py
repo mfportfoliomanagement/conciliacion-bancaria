@@ -121,9 +121,13 @@ def _codigo_http(e) -> Optional[int]:
 
 
 def _es_error_transitorio(e) -> bool:
-    """True si vale la pena reintentar (límite de lecturas, servidor
-    ocupado). False si es un error real -- ahí no hay que insistir."""
-    return _codigo_http(e) in (429, 500, 502, 503, 504)
+    """True si vale la pena reintentar: límite de lecturas / servidor
+    ocupado (código HTTP), o un corte de red (timeout, conexión
+    resetada) -- ninguno de los dos es un error real. False para todo lo
+    demás (permiso denegado, archivo inexistente): ahí no hay que insistir."""
+    if _codigo_http(e) in (429, 500, 502, 503, 504):
+        return True
+    return isinstance(e, (TimeoutError, ConnectionError))
 
 
 def _reintentable(func):
@@ -138,9 +142,10 @@ def _reintentable(func):
             except Exception as e:
                 if intento == intentos or not _es_error_transitorio(e):
                     raise
-                print(f"[drive_io] Google devolvió un error transitorio "
-                      f"({_codigo_http(e)}) en {func.__name__} -- "
-                      f"reintento {intento}/{intentos} en {espera}s...")
+                detalle = _codigo_http(e) or type(e).__name__
+                print(f"[drive_io] Error transitorio ({detalle}) en "
+                      f"{func.__name__} -- reintento {intento}/{intentos} "
+                      f"en {espera}s...")
                 time.sleep(espera)
                 espera *= 2
     return envoltura
