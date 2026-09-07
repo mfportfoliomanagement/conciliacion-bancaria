@@ -76,6 +76,13 @@ CIRCUITO_POR_CUENTA = {
     'Retenciones Ingresos Brutos CABA':         GB,
 
     'Impuestos y Tasas':                        IMP,
+    # Cuentas que arma la solapa CONCEPTOS VEP del cliente (ver
+    # conversor_extractos.cargar_vep) -- mismos nombres, literales.
+    'CARGAS SOCIALES A PAGAR':                  IMP,
+    'IVA a pagar':                              IMP,
+    'Ingresos brutos a pagar':                  IMP,
+    'Intereses fiscales':                       IMP,
+    'Impuesto a las Ganancias':                 IMP,
 
     'SUELDOS A PAGAR':                          SUE,
     'Sueldos a pagar':                          SUE,
@@ -236,7 +243,13 @@ def construir_asientos(resultados, plan_cuentas: dict):
             if circuito is None:
                 revisar_global.append((res, m, f'circuito no definido para la cuenta: {cuenta_int}'))
                 continue
-            nombre_xubio = plan_cuentas.get('nombres', {}).get(_norm(cuenta_int), cuenta_int)
+            # El nombre se usa TAL CUAL lo cargó el cliente en la planilla de
+            # origen (Conceptos/Empleados/Proveedores/VEP) -- probado contra
+            # datos reales: esa ortografía coincide con Xubio; la del Plan de
+            # Cuentas a veces no (ej. 'CARGAS SOCIALES A PAGAR' vs 'Cargas
+            # Sociales a pagar'). El Plan de Cuentas solo se usa para el
+            # control de existencia (Fase 2) y para el CBU del banco.
+            nombre_xubio = cuenta_int
 
             if circuito == INTERNO:
                 # Transferencia entre cuentas propias:
